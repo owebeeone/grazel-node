@@ -1,0 +1,25 @@
+[package]
+name = "grazel"
+version = "0.0.0"
+edition = "2021"
+description = "grazel — the gryth node: a glade application that composes glade suppliers, owns app storage, and serves gryth-ui. Spawns a glade node (wire-attached posture) + serves the session-placement bootstrap."
+
+[lib]
+name = "grazel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "grazel"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP: tiny_http — the smallest sensible choice. It is one small SYNCHRONOUS
+# crate (transitive tree: ascii, chunked_transfer, httpdate — no async runtime).
+# grazel spawns the glade node as a SUBPROCESS (process composition — the ruled
+# wire-attachment supplier posture, embedding-as-a-crate is a later
+# optimization), so grazel needs no tokio of its own. axum would drag in
+# hyper + tower + tokio just to serve static files and one JSON route.
+tiny_http = "0.12"
+# libc: SIGINT/SIGTERM handler so a clean shutdown tears down the spawned node
+# child (std has no portable signal handling). Already in the node's dep tree.
+libc = "0.2"

@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>grazel — the gryth node</title>
+<h1>grazel</h1>
+<p>The gryth node is up. This is a placeholder — gryth-ui arrives at GLP-0006 P1.S4.</p>
+<p>Session-placement bootstrap: <a href="/bootstrap.json">/bootstrap.json</a></p>
+<script>
+  // Show the bootstrap payload so the placeholder proves the seam end-to-end.
+  fetch('/bootstrap.json')
+    .then((r) => r.json())
+    .then((b) => {
+      const pre = document.createElement('pre');
+      pre.textContent = JSON.stringify(b, null, 2);
+      document.body.appendChild(pre);
+    })
+    .catch(() => {});
+</script>
