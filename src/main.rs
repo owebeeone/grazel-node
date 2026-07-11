@@ -25,6 +25,8 @@ use grazel::{bootstrap_json, ensure_data_layout, read_static, Config};
 
 /// PID of the spawned glade node, for the signal handler to tear down.
 static NODE_PID: AtomicI32 = AtomicI32::new(0);
+/// PID of the composed gwz supplier child (0 = none), torn down on shutdown.
+static GWZ_PID: AtomicI32 = AtomicI32::new(0);
 
 fn main() {
     let cfg = match Config::parse(std::env::args().skip(1)) {
@@ -119,6 +121,14 @@ fn main() {
     };
     println!("[grazel] node listening on ws://127.0.0.1:{node_port}");
 
+    // ---- compose suppliers: spawn glade-gwz as a CHILD supplier ------------
+    // Wire-attachment composition (P00-a): the supplier attaches over the node's
+    // WS carrier as an ordinary authority session — grazel just SPAWNS it and
+    // supervises it non-fatally (a supplier is OPTIONAL; its exit never stops
+    // grazel). The chat supplier is TS/in-process in the UI host, not run here;
+    // its surfaces are pre-declared in grazel-app.glade instead.
+    spawn_gwz_supplier(&cfg, node_port);
+
     // ---- serve HTTP (ui + /bootstrap.json) on a worker thread --------------
     let boot = bootstrap_json(node_port, cfg.mode.as_str(), &cfg.name);
     let ui = cfg.ui.clone();
@@ -133,8 +143,86 @@ fn main() {
     // ---- supervise: node exit is fatal -------------------------------------
     let status = child.wait().expect("wait on node");
     eprintln!("[grazel] node exited: {status}\n{}", stderr_tail(&tail));
+    // The node is gone; tear the composed supplier down too (it would otherwise
+    // spin reattaching to a dead node). A supplier exit is NOT fatal, but a node
+    // exit is — so bring the whole tree down.
+    kill_supplier();
     // Node should never exit while grazel runs -> always nonzero.
     std::process::exit(status.code().filter(|c| *c != 0).unwrap_or(1));
+}
+
+/// Spawn `glade-gwz` as a child supplier attached to the node's WS carrier.
+/// OPTIONAL: `--no-suppliers` disables it, and an ABSENT binary is a loud SKIP
+/// (never fatal — a supplier's absence must not stop grazel), mirroring the
+/// node-binary handling. Supervised non-fatally: its stdout/stderr forward with
+/// a `[gwz]` prefix and its exit only logs (grazel keeps running — the surface
+/// simply has no live provider until it is restarted).
+fn spawn_gwz_supplier(cfg: &Config, node_ws_port: u16) {
+    if cfg.no_suppliers {
+        println!("[grazel] suppliers disabled (--no-suppliers); node only");
+        return;
+    }
+    if !cfg.gwz_supplier_bin.exists() {
+        println!(
+            "[grazel] SKIP gwz supplier: binary not found at {} \
+             (build ../glade-gwz or pass --gwz-supplier-bin; a supplier is optional)",
+            cfg.gwz_supplier_bin.display()
+        );
+        return;
+    }
+    let argv = cfg.gwz_supplier_argv(node_ws_port);
+    println!("[grazel] spawning gwz supplier: {} {}", cfg.gwz_supplier_bin.display(), argv.join(" "));
+    let mut child = match Command::new(&cfg.gwz_supplier_bin)
+        .args(&argv)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            // Spawn failure is non-fatal too — log and carry on without it.
+            eprintln!("[grazel] gwz supplier failed to spawn ({e}); continuing without it");
+            return;
+        }
+    };
+    GWZ_PID.store(child.id() as i32, Ordering::SeqCst);
+
+    if let Some(out) = child.stdout.take() {
+        thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                println!("[gwz] {line}");
+            }
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                eprintln!("[gwz] {line}");
+            }
+        });
+    }
+
+    // Supervise non-fatally: reap the child and log its exit; grazel lives on.
+    thread::spawn(move || {
+        let status = child.wait();
+        GWZ_PID.store(0, Ordering::SeqCst);
+        match status {
+            Ok(s) => eprintln!("[grazel] gwz supplier exited: {s} (non-fatal; surface has no provider until respawn)"),
+            Err(e) => eprintln!("[grazel] gwz supplier wait failed: {e}"),
+        }
+    });
+}
+
+/// Tear the gwz supplier child down (SIGTERM) if one is running. Async-signal
+/// unsafe (it loads + branches), so it is called only from the normal exit path;
+/// the signal handler uses the raw async-safe `kill` directly.
+fn kill_supplier() {
+    let pid = GWZ_PID.swap(0, Ordering::SeqCst);
+    if pid > 0 {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
 }
 
 fn stderr_tail(tail: &Arc<Mutex<VecDeque<String>>>) -> String {
@@ -150,7 +238,7 @@ fn stderr_tail(tail: &Arc<Mutex<VecDeque<String>>>) -> String {
 /// owns its own thread pool internally.
 fn serve_http(port: u16, ui: &Path, bootstrap: &str) -> std::io::Result<()> {
     let server = tiny_http::Server::http(("127.0.0.1", port))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     println!("[grazel] http on http://127.0.0.1:{port} (ui {})", ui.display());
     for req in server.incoming_requests() {
         let path = req.url().split('?').next().unwrap_or("/").to_string();
@@ -186,13 +274,17 @@ fn install_signal_handlers() {
 }
 
 extern "C" fn on_signal(_sig: libc::c_int) {
-    let pid = NODE_PID.load(Ordering::SeqCst);
-    if pid > 0 {
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
-        }
-    }
+    // Tear down BOTH children (node + composed supplier). `kill` is
+    // async-signal-safe; the two atomic loads are lock-free integer reads.
+    let node = NODE_PID.load(Ordering::SeqCst);
+    let gwz = GWZ_PID.load(Ordering::SeqCst);
     unsafe {
+        if node > 0 {
+            libc::kill(node, libc::SIGTERM);
+        }
+        if gwz > 0 {
+            libc::kill(gwz, libc::SIGTERM);
+        }
         libc::_exit(130);
     }
 }

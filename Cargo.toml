@@ -23,3 +23,12 @@ tiny_http = "0.12"
 # libc: SIGINT/SIGTERM handler so a clean shutdown tears down the spawned node
 # child (std has no portable signal handling). Already in the node's dep tree.
 libc = "0.2"
+
+[dev-dependencies]
+# The composition integration test boots grazel (both mode) + the composed
+# glade-gwz supplier, then PROBES the node over the wire — exactly as a client
+# would — with the rust wire client. No node internals (P00-a); glade-client is
+# the same supplier-side client glade-gwz itself uses. `tokio` drives the async
+# probe; the existing skeleton test stays synchronous.
+glade-client = { path = "../glade/client-rs" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }

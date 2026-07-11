@@ -79,6 +79,10 @@ OPTIONS:
                               (default: apps/grazel-app.glade)
     --node-bin <PATH>         glade-node binary
                               (default: ../glade/node/target/debug/glade-node)
+    --gwz-supplier-bin <PATH> glade-gwz supplier binary; spawned as a child
+                              supplier alongside the node (skip-if-absent)
+                              (default: ../glade-gwz/target/debug/glade-gwz)
+    --no-suppliers            do NOT spawn any composed suppliers (node only)
     -h, --help               print this help
 ";
 
@@ -93,6 +97,14 @@ pub struct Config {
     pub ui: PathBuf,
     pub app: PathBuf,
     pub node_bin: PathBuf,
+    /// The `glade-gwz` supplier binary grazel spawns as a CHILD supplier
+    /// alongside the node (the wire-attachment composition, P00-a). Skipped with
+    /// a loud log line if absent (a supplier is OPTIONAL — its absence never
+    /// stops grazel), like the node-binary handling.
+    pub gwz_supplier_bin: PathBuf,
+    /// Disable composed suppliers entirely (node only). The gwz supplier is the
+    /// only one grazel runs in P1 (chat is TS/in-process in the UI host).
+    pub no_suppliers: bool,
 }
 
 impl Config {
@@ -107,6 +119,8 @@ impl Config {
         let mut ui = PathBuf::from("ui");
         let mut app = PathBuf::from("apps/grazel-app.glade");
         let mut node_bin = PathBuf::from("../glade/node/target/debug/glade-node");
+        let mut gwz_supplier_bin = PathBuf::from("../glade-gwz/target/debug/glade-gwz");
+        let mut no_suppliers = false;
 
         let mut it = args.into_iter();
         while let Some(a) = it.next() {
@@ -121,6 +135,10 @@ impl Config {
                 "--ui" => ui = PathBuf::from(next(&mut it, "--ui")?),
                 "--app" => app = PathBuf::from(next(&mut it, "--app")?),
                 "--node-bin" => node_bin = PathBuf::from(next(&mut it, "--node-bin")?),
+                "--gwz-supplier-bin" => {
+                    gwz_supplier_bin = PathBuf::from(next(&mut it, "--gwz-supplier-bin")?)
+                }
+                "--no-suppliers" => no_suppliers = true,
                 "-h" | "--help" => return Err(USAGE.to_string()),
                 other => return Err(format!("unknown argument: {other}\n\n{USAGE}")),
             }
@@ -130,7 +148,18 @@ impl Config {
         let mode = Mode::parse(&mode)
             .ok_or_else(|| format!("invalid --mode {mode:?} (want local|peer|both)\n\n{USAGE}"))?;
 
-        Ok(Config { mode, name, data, http_port, node_port, ui, app, node_bin })
+        Ok(Config {
+            mode,
+            name,
+            data,
+            http_port,
+            node_port,
+            ui,
+            app,
+            node_bin,
+            gwz_supplier_bin,
+            no_suppliers,
+        })
     }
 
     /// The `GLADE_HOME` for the spawned node: `<data>/sys`. The node nests its
@@ -154,6 +183,33 @@ impl Config {
             "--app".to_string(),
             self.app.display().to_string(),
             self.node_port.to_string(),
+        ]
+    }
+
+    /// The app-owned workspace root the gwz supplier serves against: the `files`
+    /// slot of the `<data>/{sys,files,config}` layout (the data-seam rule — glade
+    /// only ever sees the DECLARED surface, never this store). `<data>/files` is
+    /// the same dir `ensure_data_layout` created.
+    pub fn files_dir(&self) -> PathBuf {
+        self.data.join("files")
+    }
+
+    /// argv for the composed `glade-gwz` supplier (P1.S3). It attaches over the
+    /// WIRE as an ordinary authority session (P00-a) — grazel passes the node's
+    /// ACTUAL listening WS port (which may be OS-assigned), points `--root` at the
+    /// app-owned `files` store, claims the `ws-razel` share, and attributes as
+    /// `grazel`. The surfaces (`gwz.ops` service + `gwz.output` binding) ride the
+    /// app file; the supplier holds zero node internals.
+    pub fn gwz_supplier_argv(&self, node_ws_port: u16) -> Vec<String> {
+        vec![
+            "--node".to_string(),
+            format!("ws://127.0.0.1:{node_ws_port}"),
+            "--root".to_string(),
+            self.files_dir().display().to_string(),
+            "--share".to_string(),
+            "ws-razel".to_string(),
+            "--principal".to_string(),
+            "grazel".to_string(),
         ]
     }
 }
@@ -275,6 +331,8 @@ mod tests {
         assert_eq!(c.ui, PathBuf::from("ui"));
         assert_eq!(c.app, PathBuf::from("apps/grazel-app.glade"));
         assert_eq!(c.node_bin, PathBuf::from("../glade/node/target/debug/glade-node"));
+        assert_eq!(c.gwz_supplier_bin, PathBuf::from("../glade-gwz/target/debug/glade-gwz"));
+        assert!(!c.no_suppliers, "suppliers are composed by default");
     }
 
     #[test]
@@ -282,6 +340,7 @@ mod tests {
         let args = [
             "--mode", "peer", "--name", "n1", "--data", "/tmp/d", "--http", "18080",
             "--node-port", "0", "--ui", "web", "--app", "a.glade", "--node-bin", "/x/glade-node",
+            "--gwz-supplier-bin", "/x/glade-gwz", "--no-suppliers",
         ]
         .map(String::from);
         let c = Config::parse(args).unwrap();
@@ -293,6 +352,30 @@ mod tests {
         assert_eq!(c.ui, PathBuf::from("web"));
         assert_eq!(c.app, PathBuf::from("a.glade"));
         assert_eq!(c.node_bin, PathBuf::from("/x/glade-node"));
+        assert_eq!(c.gwz_supplier_bin, PathBuf::from("/x/glade-gwz"));
+        assert!(c.no_suppliers, "--no-suppliers disables composed suppliers");
+    }
+
+    #[test]
+    fn files_dir_is_under_data() {
+        let c = Config::parse(["--mode", "both", "--data", "/var/g"].map(String::from)).unwrap();
+        assert_eq!(c.files_dir(), PathBuf::from("/var/g/files"));
+    }
+
+    #[test]
+    fn gwz_supplier_argv_wires_node_root_share_principal() {
+        // The supplier attaches to the node's ACTUAL ws port, serves the app-owned
+        // files store, claims ws-razel, attributes as grazel (P1.S3).
+        let c = Config::parse(["--mode", "both", "--data", "/var/g"].map(String::from)).unwrap();
+        assert_eq!(
+            c.gwz_supplier_argv(51000),
+            vec![
+                "--node", "ws://127.0.0.1:51000",
+                "--root", "/var/g/files",
+                "--share", "ws-razel",
+                "--principal", "grazel",
+            ]
+        );
     }
 
     #[test]
