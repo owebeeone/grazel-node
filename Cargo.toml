@@ -23,6 +23,9 @@ tiny_http = "0.12"
 # libc: SIGINT/SIGTERM handler so a clean shutdown tears down the spawned node
 # child (std has no portable signal handling). Already in the node's dep tree.
 libc = "0.2"
+# Generated from datascad/garns-v2's P8 declaration. This is the live
+# application-state store; code under generated/ is never hand-edited.
+garns-p8-store = { package = "garns_generated_p8_grazel_gryth_application_state", path = "generated/p8_grazel_gryth_application_state" }
 
 [dev-dependencies]
 # The composition integration test boots grazel (both mode) + the composed

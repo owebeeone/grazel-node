@@ -3,13 +3,19 @@
 //! grazel is a glade APPLICATION (GDL-037): it composes glade suppliers, owns
 //! app storage, and serves gryth-ui. This crate holds the dependency-light,
 //! unit-testable core — CLI parsing, the mode→node-profile mapping, the data
-//! layout, the node argv, and the `/bootstrap.json` body — so that `main.rs`
+//! layout, the generated application store, the node argv, and the
+//! `/bootstrap.json` body — so that `main.rs`
 //! stays a thin orchestrator (spawn node · serve http · supervise).
 //!
 //! Nothing here touches the network or a store; nothing here reads the real
 //! `~/.glade` (the node always runs under `GLADE_HOME=<data>/sys`, never $HOME).
 
 use std::path::{Path, PathBuf};
+
+pub use garns_p8_store::{BindingError as ApplicationStoreError, Store as ApplicationStore};
+
+pub const LIVE_WORKSPACE_SHARE: &str = "ws-razel";
+pub const LIVE_WORKSPACE_NAME: &str = "razel";
 
 /// Grazel's run mode. Composes the existing glade node profiles.
 ///
@@ -69,7 +75,7 @@ USAGE:
 OPTIONS:
     --mode <local|peer|both>  run mode (required)
     --name <NAME>             node/session name (default: grazel)
-    --data <DIR>              app-owned storage root: DIR/{sys,files,config}
+    --data <DIR>              app-owned storage root: DIR/{sys,files,config,state}
                               (default: grazel-data) — NEVER the real ~/.glade
     --http <PORT>             grazel HTTP (ui + /bootstrap.json) (default: 8080)
     --node-port <PORT>        glade node WS carrier port; 0 = OS-assigned
@@ -165,7 +171,7 @@ impl Config {
     /// The `GLADE_HOME` for the spawned node: `<data>/sys`. The node nests its
     /// own `sys/<name>/` under this, so the instance lives at
     /// `<data>/sys/sys/<name>/` — glade's system tree, wholly inside the `sys`
-    /// slot of the `data/{sys,files,config}` layout, never `~/.glade`.
+    /// slot of the `data/{sys,files,config,state}` layout, never `~/.glade`.
     pub fn glade_home(&self) -> PathBuf {
         self.data.join("sys")
     }
@@ -187,11 +193,18 @@ impl Config {
     }
 
     /// The app-owned workspace root the gwz supplier serves against: the `files`
-    /// slot of the `<data>/{sys,files,config}` layout (the data-seam rule — glade
+    /// slot of the `<data>/{sys,files,config,state}` layout (the data-seam rule — glade
     /// only ever sees the DECLARED surface, never this store). `<data>/files` is
     /// the same dir `ensure_data_layout` created.
     pub fn files_dir(&self) -> PathBuf {
         self.data.join("files")
+    }
+
+    /// The live application-state database derived from Garns' P8 declaration.
+    /// It belongs to Grazel, never Glade, and therefore lives in the app-owned
+    /// `state` slot next to (not under) Glade's `sys` home.
+    pub fn application_store_path(&self) -> PathBuf {
+        self.data.join("state/grazel.sqlite3")
     }
 
     /// argv for the composed `glade-gwz` supplier (P1.S3). It attaches over the
@@ -222,17 +235,31 @@ fn parse_port(s: &str, flag: &str) -> Result<u16, String> {
     s.parse::<u16>().map_err(|_| format!("{flag}: {s:?} is not a valid port\n\n{USAGE}"))
 }
 
-/// Create the app-owned storage layout `<data>/{sys,files,config}`.
+/// Create the app-owned storage layout `<data>/{sys,files,config,state}`.
 ///
 /// The data-seam rule (README): glade never sees grazel's files. `sys` is
 /// glade's system home (`GLADE_HOME`); `files` is app-owned storage a supplier
 /// serves from only where a surface is DECLARED; `config` is grazel's own
-/// config. Private = undeclared; shared = a declared surface.
+/// config; `state` is the Garns-derived P8 application store. Private =
+/// undeclared; shared = a declared surface.
 pub fn ensure_data_layout(dir: &Path) -> std::io::Result<()> {
-    for sub in ["sys", "files", "config"] {
+    for sub in ["sys", "files", "config", "state"] {
         std::fs::create_dir_all(dir.join(sub))?;
     }
     Ok(())
+}
+
+/// Open Grazel's Garns-derived application store and ensure the workspace
+/// declared by `apps/grazel-app.glade` exists. The schema, migration, write,
+/// and query bodies all live in generated code; this function supplies only
+/// Grazel's chosen path and initial application value.
+pub fn open_application_store(
+    path: &Path,
+    now: &str,
+) -> Result<ApplicationStore, ApplicationStoreError> {
+    let store = ApplicationStore::open(path)?;
+    store.workspace_create_if_absent(LIVE_WORKSPACE_SHARE, LIVE_WORKSPACE_NAME, now)?;
+    Ok(store)
 }
 
 /// The `GET /bootstrap.json` body — the GDL-032 session-placement seam. Grant
@@ -360,6 +387,66 @@ mod tests {
     fn files_dir_is_under_data() {
         let c = Config::parse(["--mode", "both", "--data", "/var/g"].map(String::from)).unwrap();
         assert_eq!(c.files_dir(), PathBuf::from("/var/g/files"));
+    }
+
+    #[test]
+    fn application_store_path_is_under_data_state() {
+        let c = Config::parse(["--mode", "both", "--data", "/var/g"].map(String::from)).unwrap();
+        assert_eq!(
+            c.application_store_path(),
+            PathBuf::from("/var/g/state/grazel.sqlite3")
+        );
+    }
+
+    #[test]
+    fn generated_application_store_persists_and_refuses_stale_cas() {
+        let root = std::env::temp_dir().join(format!("grazel-state-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        ensure_data_layout(&root).unwrap();
+        let path = root.join("state/grazel.sqlite3");
+
+        let store = ApplicationStore::open(&path).unwrap();
+        let created = store
+            .workspace_create_if_absent("ws-live", "Live workspace", "t1")
+            .unwrap();
+        assert_eq!(created["was_created"], true);
+        let retried = store
+            .workspace_create_if_absent("ws-live", "ignored", "t2")
+            .unwrap();
+        assert_eq!(retried["was_created"], false);
+        drop(store);
+
+        let reopened = ApplicationStore::open(&path).unwrap();
+        let workspace = reopened.workspace_scalar_atom("ws-live").unwrap();
+        assert_eq!(workspace["display_name"], "Live workspace");
+        let stale = reopened
+            .workspace_cas_update("ws-live", 0, "stale", "t3")
+            .unwrap();
+        assert_eq!(stale["ok"], false);
+        assert_eq!(stale["reason"], "conflict");
+
+        drop(reopened);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn live_application_store_bootstrap_is_idempotent() {
+        let root = std::env::temp_dir().join(format!("grazel-live-state-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        ensure_data_layout(&root).unwrap();
+        let path = root.join("state/grazel.sqlite3");
+
+        let first = open_application_store(&path, "t1").unwrap();
+        let workspace = first.workspace_scalar_atom(LIVE_WORKSPACE_SHARE).unwrap();
+        assert_eq!(workspace["display_name"], LIVE_WORKSPACE_NAME);
+        drop(first);
+
+        let second = open_application_store(&path, "t2").unwrap();
+        let workspace = second.workspace_scalar_atom(LIVE_WORKSPACE_SHARE).unwrap();
+        assert_eq!(workspace["revision"], 1);
+
+        drop(second);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

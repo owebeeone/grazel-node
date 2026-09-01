@@ -156,6 +156,10 @@ fn grazel_both_mode_serves_bootstrap_static_and_node() {
     // ---- assert: isolation — the node instance lives UNDER our temp data ---
     let instance = data.join("sys").join("sys").join("grazel-it");
     assert!(instance.join("node.key").exists(), "node booted under {}, not ~/.glade", instance.display());
+    assert!(
+        data.join("state/grazel.sqlite3").exists(),
+        "grazel startup materialized its Garns-derived application store"
+    );
 
     // ---- clean shutdown: SIGTERM grazel -> node torn down ------------------
     unsafe {

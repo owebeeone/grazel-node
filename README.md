@@ -82,11 +82,34 @@ mesh-only levers.
       files/    app-owned storage grazel manages (chat history, gwz workspaces,
                 file trees — P1+). glade never sees this directly.
       config/   grazel's own configuration.
+      state/    Grazel/Gryth application state in `grazel.sqlite3`, provisioned
+                and accessed through the Garns-generated P8 Rust crate.
 
 **The seam rule:** glade never sees grazel's files. **Private data = never
 declared.** **Shared data = a declared surface a supplier serves from that
 storage** (the file↔surface mapping is grazel's alone). "Files for now" cannot
 leak into glade's model because glade only ever sees the declared surfaces.
+
+## Application-state store
+
+Grazel startup opens `DIR/state/grazel.sqlite3` and idempotently ensures the
+declared `ws-razel` workspace exists. The schema, migration ladder, four typed
+writes, and five typed reads come from the generated crate under
+`generated/p8_grazel_gryth_application_state/`; application code supplies only
+the storage path and Grazel's chosen initial workspace value. Do not hand-edit
+the generated crate.
+
+Regenerate or verify it from `datascad/garns-v2`:
+
+```sh
+python3.14 -m garns.inhabitant \
+  --schema p8_grazel_gryth_application_state \
+  --out ../../glade-wz/grazel/generated/p8_grazel_gryth_application_state
+python3.14 -m garns.inhabitant \
+  --schema p8_grazel_gryth_application_state \
+  --out ../../glade-wz/grazel/generated/p8_grazel_gryth_application_state \
+  --check
+```
 
 ## Repo name
 
