@@ -9,7 +9,9 @@ demo's `glade/apps/grazel-app.glade` copy until a shared source is factored out)
 
 **P1.S3** — grazel now composes the **glade-gwz** supplier: after the node is
 up, grazel spawns `glade-gwz` as a child process that attaches over the wire and
-stands behind the `(ws-razel, gwz.ops)` command surface (see below). The
+stands behind the `(ws-razel, gwz.ops)` command surface (see below).
+**Gyld UI step 4.2** adds the same leg for **glade-gyld**, declared by its own
+`apps/gyld-app.glade` and switched on by `--gyld-supplier-bin`. The
 **glade-chat** supplier is TS/in-process in the UI host (gryth-ui / the demo),
 NOT run by grazel; its surfaces (`chat.msgs`, `chat.groups`) are pre-declared in
 `grazel-app.glade` so they exist node-side regardless of a running TS host.
@@ -28,12 +30,16 @@ child down.
 
     grazel --mode local|peer|both [--name N] [--data DIR] [--http PORT] \
            [--node-port PORT] [--ui DIR] [--app FILE.glade] [--node-bin PATH] \
-           [--gwz-supplier-bin PATH] [--no-suppliers]
+           [--gwz-supplier-bin PATH] \
+           [--gyld-supplier-bin PATH --gyld-root DIR [--gyld-app FILE.glade]] \
+           [--no-suppliers]
 
 Defaults: `--name grazel`, `--data grazel-data`, `--http 8080`,
 `--node-port 9099` (0 = OS-assigned), `--ui ui`,
 `--app apps/grazel-app.glade`, `--node-bin ../glade/node/target/debug/glade-node`,
-`--gwz-supplier-bin ../glade-gwz/target/debug/glade-gwz`.
+`--gwz-supplier-bin ../glade-gwz/target/debug/glade-gwz`,
+`--gyld-app apps/gyld-app.glade`. The gyld leg is **default off**:
+`--gyld-supplier-bin` is its switch.
 
 ## Composed suppliers
 
@@ -47,11 +53,38 @@ is a later optimization, not the contract):
   `grazel-app.glade`) and runs allow-listed read verbs against the app-owned
   `files` store.
 
+- **glade-gyld** — `glade-gyld --node ws://127.0.0.1:<node-port>
+  --gyld-root <the Gyld checkout> --bundle-root <data>/files/gyld --share ws-razel
+  --principal grazel --static-base /gyld`. It stands behind `(ws-razel, gyld.ops)`
+  and runs allow-listed Gyld decision-stream verbs as subprocesses out of the
+  read-only checkout, building into the app-owned bundle root. **Default off**:
+  giving `--gyld-supplier-bin` switches the leg on, which is also what makes
+  grazel load `--gyld-app` (see below). Without `--gyld-root` the leg is a loud
+  SKIP: the surfaces are declared, they simply have no provider.
+
 Suppliers are **optional**: an absent `--gwz-supplier-bin` is a loud SKIP (never
 fatal), and a supplier exit only logs — grazel keeps running (the surface just
 has no live provider until it is respawned). `--no-suppliers` disables them
-entirely (node only). A SIGINT/SIGTERM to grazel, or a node exit, tears the
+entirely (node only). A SIGINT/SIGTERM to grazel, or a node exit, tears every
 supplier child down too.
+
+## App declarations: more than one `--app`
+
+`glade-node` has always accepted `--app FILE.glade` **more than once** — it
+accumulates the flag and registers each file in turn — so owner ruling O5's
+separate `apps/gyld-app.glade` costs `apps/grazel-app.glade` no change at all
+and neither of its two byte-identical homes moves. When the gyld leg is on,
+grazel passes both files to the node. Registration is idempotent by diff, so the
+`workspace ws-razel razel` entry both files declare registers once (the node
+logs the second as `1 unchanged`).
+
+## The gyld static path
+
+`GET /gyld/<path>` serves `<data>/files/gyld/<path>` when the gyld leg is on,
+through the same bounded resolver as the UI mount (a `..` segment is a 404).
+This is owner ruling O5's answer to large files: a `gyld.lens` value is a
+`{path, digest, bytes}` pointer whose `path` is one of these URLs, and the
+consumer checks the digest rather than trusting the pointer.
 
 `GET /bootstrap.json` → `{"node_ws":"ws://127.0.0.1:<node-port>","mode":<mode>,
 "name":<name>}` — the GDL-032 session-placement seam. Grant-handoff fields
@@ -81,6 +114,9 @@ mesh-only levers.
                 its own sys/<name>/ under it). NEVER the real ~/.glade.
       files/    app-owned storage grazel manages (chat history, gwz workspaces,
                 file trees — P1+). glade never sees this directly.
+                files/gyld/ is the glade-gyld supplier's bundle root: the
+                overlay modules it writes, its staging repository, and one
+                directory per build.
       config/   grazel's own configuration.
       state/    Grazel/Gryth application state in `grazel.sqlite3`, provisioned
                 and accessed through the Garns-generated P8 Rust crate.

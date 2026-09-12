@@ -1,0 +1,51 @@
+# gyld-app.glade — the Gyld decision-stream app, declared as DATA (GDL-037/038).
+#
+# A SEPARATE app declaration rather than a growing grazel-app.glade (owner ruling
+# O5, GyldGrythPlugins.md section 8). grazel loads it as a SECOND `--app` file
+# when its gyld leg is switched on with `--gyld-supplier-bin`; the glade node has
+# always accepted `--app` more than once, so grazel-app.glade stays exactly as it
+# is, byte-identical in both of its homes.
+#
+# Like every app file this one is LOADED, never compiled: each declaration
+# registers as an ordinary home-share record under the registrant's chain, and
+# each ACL seed COMPILES TO a CapabilityGrant record at registration. The fold
+# stays the only runtime authority — a runtime revocation beats a re-registered
+# seed, always.
+glade-app v0
+app gyld
+
+# binding <glade_id> <shape> <authority> <zone> <retention>
+# The surfaces the glade-gyld supplier publishes onto after a successful build
+# (GyldGrythPlugins.md 4.7, step 4.2). Pre-declared here so they exist node-side
+# whether or not a supplier is running.
+#
+#   gyld.streams    the build's streams.json, unkeyed
+#   gyld.stream     keyed by stream id: that stream's stream.json
+#   gyld.decisions  keyed by stream id: that stream's decide-now.json
+#   gyld.lens       keyed by <stream>/<perspective>: a {path, digest, bytes}
+#                   pointer, because a lens file is fetched over HTTP from
+#                   grazel's static path rather than folded onto a share
+#   gyld.output     a run's stdout and stderr lines, keyed by run id
+binding gyld.streams   value share commons latest
+binding gyld.stream    value share commons latest
+binding gyld.decisions value share commons latest
+binding gyld.lens      value share commons latest
+binding gyld.output    log   share commons from-cursor
+
+# service <name> <exchange-glade-id>
+# The authority provider grazel attaches, and the DIRECTED surface it answers.
+# Exchanges never fan out: only the claim-holding node's provider replies.
+service glade-gyld gyld.ops
+
+# seed <principal> <share> <verb[,verb...]>
+# Bootstrap shortcuts, not a parallel ACL system: compiled to CapabilityGrant
+# records at registration; ordinary fold rules (revocation wins) from then on.
+# The share named here is the workspace share these surfaces live on.
+seed owner ws-razel read.*
+seed owner ws-razel gyld.*
+
+# workspace <share> <name>
+# The same workspace share grazel-app.glade declares. Registration is idempotent
+# by diff, so loading both files registers this entry once; declaring it here
+# keeps this file loadable on its own.
+workspace ws-razel razel

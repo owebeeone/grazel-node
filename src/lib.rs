@@ -17,6 +17,12 @@ pub use garns_p8_store::{BindingError as ApplicationStoreError, Store as Applica
 pub const LIVE_WORKSPACE_SHARE: &str = "ws-razel";
 pub const LIVE_WORKSPACE_NAME: &str = "razel";
 
+/// The URL prefix grazel serves the gyld bundle root under. Owner ruling O5:
+/// the large lens files travel as pointers and are fetched from grazel's static
+/// path, so the pointers the supplier writes and the path grazel serves must
+/// agree on this one string.
+pub const GYLD_STATIC_BASE: &str = "/gyld";
+
 /// Grazel's run mode. Composes the existing glade node profiles.
 ///
 /// The node binary makes NO serve-only / mesh-only distinction: EVERY booted
@@ -88,6 +94,13 @@ OPTIONS:
     --gwz-supplier-bin <PATH> glade-gwz supplier binary; spawned as a child
                               supplier alongside the node (skip-if-absent)
                               (default: ../glade-gwz/target/debug/glade-gwz)
+    --gyld-supplier-bin <PATH> glade-gyld supplier binary. DEFAULT OFF: giving
+                              this flag switches the gyld leg on, which also
+                              loads --gyld-app as a second app file
+    --gyld-root <DIR>         the Gyld checkout glade-gyld runs its hosts out
+                              of, read only (required by the gyld leg)
+    --gyld-app <FILE.glade>   the gyld app declaration loaded beside grazel's
+                              (default: apps/gyld-app.glade)
     --no-suppliers            do NOT spawn any composed suppliers (node only)
     -h, --help               print this help
 ";
@@ -108,6 +121,17 @@ pub struct Config {
     /// a loud log line if absent (a supplier is OPTIONAL — its absence never
     /// stops grazel), like the node-binary handling.
     pub gwz_supplier_bin: PathBuf,
+    /// The `glade-gyld` supplier binary, and the switch for the whole gyld leg.
+    /// `None` (the default) means grazel neither loads `gyld_app` nor spawns the
+    /// supplier: the gyld surfaces simply do not exist on this node.
+    pub gyld_supplier_bin: Option<PathBuf>,
+    /// The Gyld checkout `glade-gyld` runs its hosts out of. Read only to the
+    /// supplier, and required by the gyld leg: without it the leg is skipped.
+    pub gyld_root: Option<PathBuf>,
+    /// The gyld app declaration, loaded as a SECOND `--app` file when the gyld
+    /// leg is on (owner ruling O5 — a separate file, not a grown
+    /// `grazel-app.glade`).
+    pub gyld_app: PathBuf,
     /// Disable composed suppliers entirely (node only). The gwz supplier is the
     /// only one grazel runs in P1 (chat is TS/in-process in the UI host).
     pub no_suppliers: bool,
@@ -126,6 +150,9 @@ impl Config {
         let mut app = PathBuf::from("apps/grazel-app.glade");
         let mut node_bin = PathBuf::from("../glade/node/target/debug/glade-node");
         let mut gwz_supplier_bin = PathBuf::from("../glade-gwz/target/debug/glade-gwz");
+        let mut gyld_supplier_bin: Option<PathBuf> = None;
+        let mut gyld_root: Option<PathBuf> = None;
+        let mut gyld_app = PathBuf::from("apps/gyld-app.glade");
         let mut no_suppliers = false;
 
         let mut it = args.into_iter();
@@ -144,6 +171,13 @@ impl Config {
                 "--gwz-supplier-bin" => {
                     gwz_supplier_bin = PathBuf::from(next(&mut it, "--gwz-supplier-bin")?)
                 }
+                "--gyld-supplier-bin" => {
+                    gyld_supplier_bin = Some(PathBuf::from(next(&mut it, "--gyld-supplier-bin")?))
+                }
+                "--gyld-root" => {
+                    gyld_root = Some(PathBuf::from(next(&mut it, "--gyld-root")?))
+                }
+                "--gyld-app" => gyld_app = PathBuf::from(next(&mut it, "--gyld-app")?),
                 "--no-suppliers" => no_suppliers = true,
                 "-h" | "--help" => return Err(USAGE.to_string()),
                 other => return Err(format!("unknown argument: {other}\n\n{USAGE}")),
@@ -164,6 +198,9 @@ impl Config {
             app,
             node_bin,
             gwz_supplier_bin,
+            gyld_supplier_bin,
+            gyld_root,
+            gyld_app,
             no_suppliers,
         })
     }
@@ -177,19 +214,68 @@ impl Config {
     }
 
     /// argv for `glade-node` (the booted profile form, GDL-036/037):
-    /// `--profile <p> --name <name> --app <file> <node_port>`. No positional
+    /// `--profile <p> --name <name> --app <file>... <node_port>`. No positional
     /// store dir — the node defaults it under its own instance cache, keeping
     /// glade's store layout glade's business (the data-seam rule).
+    ///
+    /// `--app` REPEATS when the gyld leg is on: the node has always accepted the
+    /// flag more than once (`glade-node.rs` accumulates them and registers each
+    /// in turn), which is why owner ruling O5's separate `gyld-app.glade` costs
+    /// grazel-app.glade no change at all.
     pub fn node_argv(&self) -> Vec<String> {
-        vec![
+        let mut argv = vec![
             "--profile".to_string(),
             self.mode.node_profile().to_string(),
             "--name".to_string(),
             self.name.clone(),
             "--app".to_string(),
             self.app.display().to_string(),
-            self.node_port.to_string(),
-        ]
+        ];
+        if self.gyld_enabled() {
+            argv.push("--app".to_string());
+            argv.push(self.gyld_app.display().to_string());
+        }
+        argv.push(self.node_port.to_string());
+        argv
+    }
+
+    /// Is the gyld leg switched on? `--gyld-supplier-bin` is the switch, and
+    /// `--no-suppliers` turns every composed supplier off.
+    pub fn gyld_enabled(&self) -> bool {
+        self.gyld_supplier_bin.is_some() && !self.no_suppliers
+    }
+
+    /// The app-owned bundle root glade-gyld owns: the `gyld` slot of the `files`
+    /// store (section 4.7 — `<data>/files/gyld/`). glade only ever sees the
+    /// DECLARED surfaces, never this tree; grazel serves its files over the
+    /// static path so a lens pointer resolves.
+    pub fn gyld_dir(&self) -> PathBuf {
+        self.files_dir().join("gyld")
+    }
+
+    /// argv for the composed `glade-gyld` supplier (step 4.2), or `None` when
+    /// the leg cannot run: no binary, or no `--gyld-root` for it to run the Gyld
+    /// hosts out of. Like the gwz leg it attaches over the WIRE (P00-a) to the
+    /// node's ACTUAL listening port, claims the `ws-razel` share and attributes
+    /// as `grazel`; unlike it, it carries TWO roots — a read-only Gyld checkout
+    /// and the app-owned bundle root.
+    pub fn gyld_supplier_argv(&self, node_ws_port: u16) -> Option<Vec<String>> {
+        let gyld_root = self.gyld_root.as_ref()?;
+        self.gyld_supplier_bin.as_ref()?;
+        Some(vec![
+            "--node".to_string(),
+            format!("ws://127.0.0.1:{node_ws_port}"),
+            "--gyld-root".to_string(),
+            gyld_root.display().to_string(),
+            "--bundle-root".to_string(),
+            self.gyld_dir().display().to_string(),
+            "--share".to_string(),
+            "ws-razel".to_string(),
+            "--principal".to_string(),
+            "grazel".to_string(),
+            "--static-base".to_string(),
+            GYLD_STATIC_BASE.to_string(),
+        ])
     }
 
     /// The app-owned workspace root the gwz supplier serves against: the `files`
@@ -463,6 +549,92 @@ mod tests {
                 "--principal", "grazel",
             ]
         );
+    }
+
+    #[test]
+    fn the_gyld_leg_is_off_by_default() {
+        // Default off (step 4.2): no second app file, no supplier argv, and the
+        // node argv is byte for byte what it was before the leg existed.
+        let c = Config::parse(["--mode", "both", "--name", "grz"].map(String::from)).unwrap();
+        assert!(!c.gyld_enabled());
+        assert_eq!(c.gyld_supplier_argv(51000), None);
+        assert_eq!(
+            c.node_argv(),
+            vec!["--profile", "local", "--name", "grz", "--app", "apps/grazel-app.glade", "9099"]
+        );
+    }
+
+    #[test]
+    fn the_gyld_leg_loads_a_second_app_file() {
+        // `--app` repeats: grazel-app.glade is untouched and gyld-app.glade
+        // rides beside it (owner ruling O5; the node accumulates --app).
+        let c = Config::parse(
+            ["--mode", "both", "--name", "grz", "--gyld-supplier-bin", "/bin/glade-gyld"]
+                .map(String::from),
+        )
+        .unwrap();
+        assert!(c.gyld_enabled());
+        assert_eq!(
+            c.node_argv(),
+            vec![
+                "--profile", "local", "--name", "grz",
+                "--app", "apps/grazel-app.glade",
+                "--app", "apps/gyld-app.glade",
+                "9099",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_suppliers_turns_the_gyld_leg_off_entirely() {
+        let c = Config::parse(
+            ["--mode", "both", "--gyld-supplier-bin", "/bin/glade-gyld", "--no-suppliers"]
+                .map(String::from),
+        )
+        .unwrap();
+        assert!(!c.gyld_enabled());
+        assert!(!c.node_argv().iter().any(|a| a.ends_with("gyld-app.glade")));
+    }
+
+    #[test]
+    fn gyld_supplier_argv_carries_both_roots_and_the_static_base() {
+        let c = Config::parse(
+            [
+                "--mode", "both", "--data", "/var/g",
+                "--gyld-supplier-bin", "/bin/glade-gyld",
+                "--gyld-root", "/src/gyld",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(c.gyld_dir(), PathBuf::from("/var/g/files/gyld"));
+        assert_eq!(
+            c.gyld_supplier_argv(51000),
+            Some(
+                [
+                    "--node", "ws://127.0.0.1:51000",
+                    "--gyld-root", "/src/gyld",
+                    "--bundle-root", "/var/g/files/gyld",
+                    "--share", "ws-razel",
+                    "--principal", "grazel",
+                    "--static-base", "/gyld",
+                ]
+                .map(String::from)
+                .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn the_gyld_leg_without_a_checkout_has_no_supplier_argv() {
+        // The surfaces are still declared; only the provider is missing, which
+        // main turns into a loud SKIP rather than a failure.
+        let c = Config::parse(
+            ["--mode", "both", "--gyld-supplier-bin", "/bin/glade-gyld"].map(String::from),
+        )
+        .unwrap();
+        assert!(c.gyld_enabled());
+        assert_eq!(c.gyld_supplier_argv(51000), None);
     }
 
     #[test]

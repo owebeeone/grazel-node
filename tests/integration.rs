@@ -321,7 +321,7 @@ async fn grazel_both_mode_composes_gwz_supplier() {
         .expect("probe connects to the node");
 
     // poll until the supplier has attached AND the workspace claim routes.
-    let status = poll_exchange(&requester, br#"{"verb":"status"}"#, |p| {
+    let status = poll_exchange(&requester, "gwz.ops", br#"{"verb":"status"}"#, |p| {
         p.contains("\"exit\":0") && p.contains("\"attributed_to\":\"grazel\"")
     })
     .await;
@@ -331,7 +331,7 @@ async fn grazel_both_mode_composes_gwz_supplier() {
     );
 
     // a disallowed verb comes back as DATA (failure honestly rendered), never a hang.
-    let denied = poll_exchange(&requester, br#"{"verb":"commit","args":["-m","x"]}"#, |p| {
+    let denied = poll_exchange(&requester, "gwz.ops", br#"{"verb":"commit","args":["-m","x"]}"#, |p| {
         p.contains("\"ok\":false") && p.contains("allow-list")
     })
     .await;
@@ -362,15 +362,16 @@ async fn grazel_both_mode_composes_gwz_supplier() {
     std::fs::remove_dir_all(&base).ok();
 }
 
-/// Poll `gwz.ops` with `envelope` until the decoded payload string satisfies
-/// `want` (or a ~15s deadline). Returns the matching payload string.
+/// Poll one exchange surface with `envelope` until the decoded payload string
+/// satisfies `want` (or a ~15s deadline). Returns the matching payload string.
 async fn poll_exchange(
     client: &glade_client::GladeClient,
+    glade_id: &str,
     envelope: &[u8],
     want: impl Fn(&str) -> bool,
 ) -> Option<String> {
     for _ in 0..150 {
-        if let Ok(out) = client.exchange("ws-razel", "gwz.ops", envelope.to_vec()).await {
+        if let Ok(out) = client.exchange("ws-razel", glade_id, envelope.to_vec()).await {
             if out.ok {
                 if let Some(payload) = out.payload {
                     let s = String::from_utf8_lossy(&payload).into_owned();
@@ -383,4 +384,159 @@ async fn poll_exchange(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     None
+}
+
+// ---- step 4.2: grazel composes the glade-gyld supplier and loads its app ----
+
+fn glade_gyld_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("glade-gyld")
+}
+
+fn glade_gyld_bin() -> PathBuf {
+    glade_gyld_dir().join("target").join("debug").join("glade-gyld")
+}
+
+/// Build glade-gyld; false => SKIP (build broken twice — a parallel edit, say).
+fn build_gyld_or_skip() -> bool {
+    for attempt in 1..=2 {
+        let ok = Command::new("cargo")
+            .args(["build", "--offline", "--bin", "glade-gyld"])
+            .current_dir(glade_gyld_dir())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok && glade_gyld_bin().exists() {
+            return true;
+        }
+        eprintln!("[test] glade-gyld build attempt {attempt} failed");
+    }
+    eprintln!("\n=========== SKIP: grazel gyld-composition test ===========");
+    eprintln!("  glade-gyld failed to build twice — skipping the composition test.");
+    eprintln!("=========================================================\n");
+    false
+}
+
+/// grazel's gyld leg end to end: TWO app files load into one node (the answer to
+/// owner ruling O5's open multi-app question — `glade-node` has always accepted
+/// `--app` more than once), the composed glade-gyld supplier attaches to
+/// `gyld.ops` while glade-gwz still answers `gwz.ops`, and the bundle root is
+/// served over the static path the lens pointers name.
+#[tokio::test(flavor = "multi_thread")]
+async fn grazel_both_mode_composes_gyld_supplier_and_loads_a_second_app_file() {
+    if !build_node_or_skip() || !build_gwz_or_skip() || !build_gyld_or_skip() {
+        return; // loud SKIP already printed
+    }
+
+    let base =
+        std::env::temp_dir().join(format!("grazel-gyld-it-{}-{}", std::process::id(), free_port()));
+    let data = base.join("data");
+    let ui = base.join("ui");
+    let home = base.join("home");
+    let gyld_root = base.join("gyld-checkout");
+    std::fs::create_dir_all(&ui).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(gyld_root.join("scripts")).unwrap();
+    std::fs::create_dir_all(gyld_root.join("examples")).unwrap();
+    std::fs::write(ui.join("index.html"), b"<h1>grazel gyld it</h1>").unwrap();
+
+    let apps = Path::new(env!("CARGO_MANIFEST_DIR")).join("apps");
+    let http_port = free_port();
+
+    let mut grazel = Command::new(env!("CARGO_BIN_EXE_grazel"))
+        .args([
+            "--mode", "both",
+            "--name", "grazel-gyld-it",
+            "--data", data.to_str().unwrap(),
+            "--ui", ui.to_str().unwrap(),
+            "--http", &http_port.to_string(),
+            "--node-port", "0",
+            "--node-bin", node_bin().to_str().unwrap(),
+            "--app", apps.join("grazel-app.glade").to_str().unwrap(),
+            "--gyld-app", apps.join("gyld-app.glade").to_str().unwrap(),
+            "--gwz-supplier-bin", glade_gwz_bin().to_str().unwrap(),
+            "--gyld-supplier-bin", glade_gyld_bin().to_str().unwrap(),
+            "--gyld-root", gyld_root.to_str().unwrap(),
+        ])
+        .env("HOME", &home)
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn grazel");
+
+    let boot = String::from_utf8(
+        wait_for_200(http_port, "/bootstrap.json", 30).expect("grazel serves /bootstrap.json"),
+    )
+    .unwrap();
+    let ws_port = node_ws_port(&boot).expect("bootstrap carries a node ws port");
+
+    let requester = glade_client::GladeClient::new("grazel-gyld-probe");
+    requester
+        .connect(&format!("ws://127.0.0.1:{ws_port}"))
+        .await
+        .expect("probe connects to the node");
+
+    // The gyld app file registered: `gyld.ops` routes to the composed supplier,
+    // which answers `list` with a readable refusal (no bundle has been built).
+    let listed = poll_exchange(&requester, "gyld.ops", br#"{"verb":"list"}"#, |p| {
+        p.contains("\"ok\":false") && p.contains("no bundle")
+    })
+    .await;
+    assert!(
+        listed.is_some(),
+        "the composed gyld supplier attached and answered on the surface gyld-app.glade declares"
+    );
+    assert!(
+        listed.as_deref().unwrap_or("").contains("\"attributed_to\":\"grazel\""),
+        "the gyld supplier attributes as grazel: {listed:?}"
+    );
+
+    // A refused verb is data here too, never a hang.
+    let denied = poll_exchange(&requester, "gyld.ops", br#"{"verb":"capture"}"#, |p| {
+        p.contains("\"ok\":false") && p.contains("allow-list")
+    })
+    .await;
+    assert!(denied.is_some(), "a disallowed gyld verb is refused as data");
+
+    // BOTH app files are live in the one node: gwz.ops still answers.
+    let status = poll_exchange(&requester, "gwz.ops", br#"{"verb":"status"}"#, |p| {
+        p.contains("\"attributed_to\":\"grazel\"")
+    })
+    .await;
+    assert!(
+        status.is_some(),
+        "grazel-app.glade's gwz.ops still routes: the node loaded two app files"
+    );
+
+    // The bundle root is on the static path, which is what a `gyld.lens` pointer
+    // names, and the same bounded resolver refuses a traversal.
+    let lens = data.join("files/gyld/builds/b1/streams/base/lenses/decisions.lens.json");
+    std::fs::create_dir_all(lens.parent().unwrap()).unwrap();
+    std::fs::write(&lens, br#"{"format":"gyld.lens.v1"}"#).unwrap();
+    let served = wait_for_200(http_port, "/gyld/builds/b1/streams/base/lenses/decisions.lens.json", 10);
+    assert_eq!(
+        served.as_deref(),
+        Some(&br#"{"format":"gyld.lens.v1"}"#[..]),
+        "grazel serves the gyld bundle root under /gyld"
+    );
+    let (code, _) = http_get(http_port, "/gyld/../ui/index.html").expect("a response");
+    assert_eq!(code, 404, "the static mount refuses a traversal out of the bundle root");
+
+    requester.close().await;
+
+    unsafe {
+        libc::kill(grazel.id() as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let exited = loop {
+        match grazel.try_wait().unwrap() {
+            Some(_) => break true,
+            None if Instant::now() >= deadline => break false,
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    assert!(exited, "grazel exits on SIGTERM");
+
+    let _ = grazel.wait();
+    std::fs::remove_dir_all(&base).ok();
 }

@@ -21,12 +21,17 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use grazel::{bootstrap_json, ensure_data_layout, open_application_store, read_static, Config};
+use grazel::{
+    bootstrap_json, ensure_data_layout, open_application_store, read_static, Config,
+    GYLD_STATIC_BASE,
+};
 
 /// PID of the spawned glade node, for the signal handler to tear down.
 static NODE_PID: AtomicI32 = AtomicI32::new(0);
 /// PID of the composed gwz supplier child (0 = none), torn down on shutdown.
 static GWZ_PID: AtomicI32 = AtomicI32::new(0);
+/// PID of the composed gyld supplier child (0 = none), torn down on shutdown.
+static GYLD_PID: AtomicI32 = AtomicI32::new(0);
 
 fn main() {
     let cfg = match Config::parse(std::env::args().skip(1)) {
@@ -147,13 +152,15 @@ fn main() {
     // grazel). The chat supplier is TS/in-process in the UI host, not run here;
     // its surfaces are pre-declared in grazel-app.glade instead.
     spawn_gwz_supplier(&cfg, node_port);
+    spawn_gyld_supplier(&cfg, node_port);
 
-    // ---- serve HTTP (ui + /bootstrap.json) on a worker thread --------------
+    // ---- serve HTTP (ui + /bootstrap.json + the gyld bundle root) ----------
     let boot = bootstrap_json(node_port, cfg.mode.as_str(), &cfg.name);
     let ui = cfg.ui.clone();
+    let gyld = cfg.gyld_enabled().then(|| cfg.gyld_dir());
     let http_port = cfg.http_port;
     thread::spawn(move || {
-        if let Err(e) = serve_http(http_port, &ui, &boot) {
+        if let Err(e) = serve_http(http_port, &ui, &boot, gyld.as_deref()) {
             eprintln!("[grazel] http server error: {e}");
             std::process::exit(2);
         }
@@ -189,10 +196,51 @@ fn spawn_gwz_supplier(cfg: &Config, node_ws_port: u16) {
         );
         return;
     }
-    let argv = cfg.gwz_supplier_argv(node_ws_port);
-    println!("[grazel] spawning gwz supplier: {} {}", cfg.gwz_supplier_bin.display(), argv.join(" "));
-    let mut child = match Command::new(&cfg.gwz_supplier_bin)
-        .args(&argv)
+    spawn_supplier("gwz", &cfg.gwz_supplier_bin, &cfg.gwz_supplier_argv(node_ws_port), &GWZ_PID);
+}
+
+/// Spawn `glade-gyld` as a child supplier, on the same terms as the gwz one and
+/// with the same OPTIONAL posture. The difference is the switch: the gyld leg is
+/// DEFAULT OFF and `--gyld-supplier-bin` turns it on, which is also what makes
+/// grazel load `gyld-app.glade` as a second app file (owner ruling O5).
+fn spawn_gyld_supplier(cfg: &Config, node_ws_port: u16) {
+    if !cfg.gyld_enabled() {
+        return;
+    }
+    let bin = match cfg.gyld_supplier_bin.as_ref() {
+        Some(b) => b,
+        None => {
+            return;
+        }
+    };
+    let argv = match cfg.gyld_supplier_argv(node_ws_port) {
+        Some(a) => a,
+        None => {
+            println!(
+                "[grazel] SKIP gyld supplier: --gyld-root is required (the Gyld checkout its \
+                 hosts run out of); the gyld surfaces are declared but have no provider"
+            );
+            return;
+        }
+    };
+    if !bin.exists() {
+        println!(
+            "[grazel] SKIP gyld supplier: binary not found at {} \
+             (build ../glade-gyld; a supplier is optional)",
+            bin.display()
+        );
+        return;
+    }
+    spawn_supplier("gyld", bin, &argv, &GYLD_PID);
+}
+
+/// Spawn one composed supplier child, forward its output under `[label]`, and
+/// supervise it non-fatally: a supplier exit only logs, because its surface
+/// simply has no live provider until it is restarted.
+fn spawn_supplier(label: &'static str, bin: &Path, argv: &[String], slot: &'static AtomicI32) {
+    println!("[grazel] spawning {label} supplier: {} {}", bin.display(), argv.join(" "));
+    let mut child = match Command::new(bin)
+        .args(argv)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -200,23 +248,23 @@ fn spawn_gwz_supplier(cfg: &Config, node_ws_port: u16) {
         Ok(c) => c,
         Err(e) => {
             // Spawn failure is non-fatal too — log and carry on without it.
-            eprintln!("[grazel] gwz supplier failed to spawn ({e}); continuing without it");
+            eprintln!("[grazel] {label} supplier failed to spawn ({e}); continuing without it");
             return;
         }
     };
-    GWZ_PID.store(child.id() as i32, Ordering::SeqCst);
+    slot.store(child.id() as i32, Ordering::SeqCst);
 
     if let Some(out) = child.stdout.take() {
         thread::spawn(move || {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
-                println!("[gwz] {line}");
+                println!("[{label}] {line}");
             }
         });
     }
     if let Some(err) = child.stderr.take() {
         thread::spawn(move || {
             for line in BufReader::new(err).lines().map_while(Result::ok) {
-                eprintln!("[gwz] {line}");
+                eprintln!("[{label}] {line}");
             }
         });
     }
@@ -224,22 +272,26 @@ fn spawn_gwz_supplier(cfg: &Config, node_ws_port: u16) {
     // Supervise non-fatally: reap the child and log its exit; grazel lives on.
     thread::spawn(move || {
         let status = child.wait();
-        GWZ_PID.store(0, Ordering::SeqCst);
+        slot.store(0, Ordering::SeqCst);
         match status {
-            Ok(s) => eprintln!("[grazel] gwz supplier exited: {s} (non-fatal; surface has no provider until respawn)"),
-            Err(e) => eprintln!("[grazel] gwz supplier wait failed: {e}"),
+            Ok(s) => eprintln!(
+                "[grazel] {label} supplier exited: {s} (non-fatal; surface has no provider until respawn)"
+            ),
+            Err(e) => eprintln!("[grazel] {label} supplier wait failed: {e}"),
         }
     });
 }
 
-/// Tear the gwz supplier child down (SIGTERM) if one is running. Async-signal
-/// unsafe (it loads + branches), so it is called only from the normal exit path;
-/// the signal handler uses the raw async-safe `kill` directly.
+/// Tear every composed supplier child down (SIGTERM). Async-signal unsafe (it
+/// loads + branches), so it is called only from the normal exit path; the signal
+/// handler uses the raw async-safe `kill` directly.
 fn kill_supplier() {
-    let pid = GWZ_PID.swap(0, Ordering::SeqCst);
-    if pid > 0 {
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
+    for slot in [&GWZ_PID, &GYLD_PID] {
+        let pid = slot.swap(0, Ordering::SeqCst);
+        if pid > 0 {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
         }
     }
 }
@@ -253,18 +305,43 @@ fn stderr_tail(tail: &Arc<Mutex<VecDeque<String>>>) -> String {
     }
 }
 
-/// Serve static files from `ui` plus `GET /bootstrap.json`. Blocking; tiny_http
-/// owns its own thread pool internally.
-fn serve_http(port: u16, ui: &Path, bootstrap: &str) -> std::io::Result<()> {
+/// Serve static files from `ui`, `GET /bootstrap.json`, and — when the gyld leg
+/// is on — the gyld bundle root under `GYLD_STATIC_BASE`. That last mount is
+/// owner ruling O5's answer to large files: a `gyld.lens` value is a `{path,
+/// digest, bytes}` pointer whose `path` is exactly one of these URLs, and the
+/// consumer checks the digest rather than trusting the pointer. It is the SAME
+/// bounded resolver as the UI mount, so `..` never escapes the root. Blocking;
+/// tiny_http owns its own thread pool internally.
+fn serve_http(
+    port: u16,
+    ui: &Path,
+    bootstrap: &str,
+    gyld: Option<&Path>,
+) -> std::io::Result<()> {
     let server = tiny_http::Server::http(("127.0.0.1", port))
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     println!("[grazel] http on http://127.0.0.1:{port} (ui {})", ui.display());
+    if let Some(root) = gyld {
+        println!("[grazel] http {GYLD_STATIC_BASE}/ -> {}", root.display());
+    }
     for req in server.incoming_requests() {
         let path = req.url().split('?').next().unwrap_or("/").to_string();
+        let gyld_rest = gyld.and_then(|root| {
+            path.strip_prefix(GYLD_STATIC_BASE)
+                .filter(|rest| rest.starts_with('/'))
+                .map(|rest| (root, rest.to_string()))
+        });
         let resp = if path == "/bootstrap.json" {
             tiny_http::Response::from_string(bootstrap.to_string())
                 .with_header(header("Content-Type", "application/json"))
                 .boxed()
+        } else if let Some((root, rest)) = gyld_rest {
+            match read_static(root, &rest) {
+                Some((bytes, ctype)) => tiny_http::Response::from_data(bytes)
+                    .with_header(header("Content-Type", ctype))
+                    .boxed(),
+                None => tiny_http::Response::from_string("not found").with_status_code(404).boxed(),
+            }
         } else {
             match read_static(ui, &path) {
                 Some((bytes, ctype)) => {
@@ -297,12 +374,16 @@ extern "C" fn on_signal(_sig: libc::c_int) {
     // async-signal-safe; the two atomic loads are lock-free integer reads.
     let node = NODE_PID.load(Ordering::SeqCst);
     let gwz = GWZ_PID.load(Ordering::SeqCst);
+    let gyld = GYLD_PID.load(Ordering::SeqCst);
     unsafe {
         if node > 0 {
             libc::kill(node, libc::SIGTERM);
         }
         if gwz > 0 {
             libc::kill(gwz, libc::SIGTERM);
+        }
+        if gyld > 0 {
+            libc::kill(gyld, libc::SIGTERM);
         }
         libc::_exit(130);
     }
