@@ -25,11 +25,17 @@ app gyld
 #   gyld.lens       keyed by <stream>/<perspective>: a {path, digest, bytes}
 #                   pointer, because a lens file is fetched over HTTP from
 #                   grazel's static path rather than folded onto a share
+#   gyld.file       keyed by <stream>/<file>: the same kind of pointer, for
+#                   that stream's projection.json (the records) and
+#                   validation.json. Without it a glade root can read no
+#                   record at all — the build directory had to be added as a
+#                   static root by hand and re-pointed after every build.
 #   gyld.output     a run's stdout and stderr lines, keyed by run id
 binding gyld.streams   value share commons latest
 binding gyld.stream    value share commons latest
 binding gyld.decisions value share commons latest
 binding gyld.lens      value share commons latest
+binding gyld.file      value share commons latest
 binding gyld.output    log   share commons from-cursor
 
 # service <name> <exchange-glade-id>
