@@ -31,12 +31,21 @@ app gyld
 #                   record at all — the build directory had to be added as a
 #                   static root by hand and re-pointed after every build.
 #   gyld.output     a run's stdout and stderr lines, keyed by run id
+#   gyld.ask        the ask agent's reply, keyed by CONVERSATION id rather than
+#                   by run id (GyldAskAgent.md sections 4 and 6). That one
+#                   deviation from gyld.output's shape is what makes a
+#                   conversation one fold, one mount and one key: each turn
+#                   keeps its own run_id on every record for the audit trail,
+#                   and each turn's `end` closes that turn without closing the
+#                   conversation. Keying by run id instead would need one mount
+#                   per question asked.
 binding gyld.streams   value share commons latest
 binding gyld.stream    value share commons latest
 binding gyld.decisions value share commons latest
 binding gyld.lens      value share commons latest
 binding gyld.file      value share commons latest
 binding gyld.output    log   share commons from-cursor
+binding gyld.ask       log   share commons from-cursor
 
 # service <name> <exchange-glade-id>
 # The authority provider grazel attaches, and the DIRECTED surface it answers.
@@ -48,6 +57,8 @@ service glade-gyld gyld.ops
 # records at registration; ordinary fold rules (revocation wins) from then on.
 # The share named here is the workspace share these surfaces live on.
 seed owner ws-razel read.*
+# `gyld.*` covers every surface above, gyld.ask included: the seeds name a verb
+# PATTERN, so a new gyld surface needs no new seed line.
 seed owner ws-razel gyld.*
 
 # workspace <share> <name>
