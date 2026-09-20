@@ -99,6 +99,10 @@ OPTIONS:
                               loads --gyld-app as a second app file
     --gyld-root <DIR>         the Gyld checkout glade-gyld runs its hosts out
                               of, read only (required by the gyld leg)
+    --gyld-decisions-root <DIR> the git-tracked folder the written overlay
+                              modules (notebooks) are left in; passed to the
+                              supplier as --decisions-root. Optional: without
+                              it they live in the bundle root
     --gyld-app <FILE.glade>   the gyld app declaration loaded beside grazel's
                               (default: apps/gyld-app.glade)
     --no-suppliers            do NOT spawn any composed suppliers (node only)
@@ -128,6 +132,11 @@ pub struct Config {
     /// The Gyld checkout `glade-gyld` runs its hosts out of. Read only to the
     /// supplier, and required by the gyld leg: without it the leg is skipped.
     pub gyld_root: Option<PathBuf>,
+    /// The folder the supplier leaves a written overlay module in — the owner's
+    /// git-tracked decisions folder, handed on as `--decisions-root`. Optional:
+    /// without it the supplier keeps its notebooks in the bundle root, which is
+    /// under this instance's own data directory.
+    pub gyld_decisions_root: Option<PathBuf>,
     /// The gyld app declaration, loaded as a SECOND `--app` file when the gyld
     /// leg is on (owner ruling O5 — a separate file, not a grown
     /// `grazel-app.glade`).
@@ -152,6 +161,7 @@ impl Config {
         let mut gwz_supplier_bin = PathBuf::from("../glade-gwz/target/debug/glade-gwz");
         let mut gyld_supplier_bin: Option<PathBuf> = None;
         let mut gyld_root: Option<PathBuf> = None;
+        let mut gyld_decisions_root: Option<PathBuf> = None;
         let mut gyld_app = PathBuf::from("apps/gyld-app.glade");
         let mut no_suppliers = false;
 
@@ -177,6 +187,10 @@ impl Config {
                 "--gyld-root" => {
                     gyld_root = Some(PathBuf::from(next(&mut it, "--gyld-root")?))
                 }
+                "--gyld-decisions-root" => {
+                    gyld_decisions_root =
+                        Some(PathBuf::from(next(&mut it, "--gyld-decisions-root")?))
+                }
                 "--gyld-app" => gyld_app = PathBuf::from(next(&mut it, "--gyld-app")?),
                 "--no-suppliers" => no_suppliers = true,
                 "-h" | "--help" => return Err(USAGE.to_string()),
@@ -200,6 +214,7 @@ impl Config {
             gwz_supplier_bin,
             gyld_supplier_bin,
             gyld_root,
+            gyld_decisions_root,
             gyld_app,
             no_suppliers,
         })
@@ -262,20 +277,33 @@ impl Config {
     pub fn gyld_supplier_argv(&self, node_ws_port: u16) -> Option<Vec<String>> {
         let gyld_root = self.gyld_root.as_ref()?;
         self.gyld_supplier_bin.as_ref()?;
-        Some(vec![
+        let mut argv = vec![
             "--node".to_string(),
             format!("ws://127.0.0.1:{node_ws_port}"),
             "--gyld-root".to_string(),
             gyld_root.display().to_string(),
             "--bundle-root".to_string(),
             self.gyld_dir().display().to_string(),
-            "--share".to_string(),
-            "ws-razel".to_string(),
-            "--principal".to_string(),
-            "grazel".to_string(),
-            "--static-base".to_string(),
-            GYLD_STATIC_BASE.to_string(),
-        ])
+        ];
+        // The owner's decisions folder, when there is one. Optional the whole
+        // way down: a supplier that is passed none keeps its notebooks in the
+        // bundle root, and the flag is simply absent rather than empty.
+        if let Some(decisions) = self.gyld_decisions_root.as_ref() {
+            argv.push("--decisions-root".to_string());
+            argv.push(decisions.display().to_string());
+        }
+        argv.extend(
+            [
+                "--share",
+                "ws-razel",
+                "--principal",
+                "grazel",
+                "--static-base",
+                GYLD_STATIC_BASE,
+            ]
+            .map(String::from),
+        );
+        Some(argv)
     }
 
     /// The app-owned workspace root the gwz supplier serves against: the `files`
@@ -608,6 +636,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.gyld_dir(), PathBuf::from("/var/g/files/gyld"));
+        assert_eq!(c.gyld_decisions_root, None);
         assert_eq!(
             c.gyld_supplier_argv(51000),
             Some(
@@ -623,6 +652,52 @@ mod tests {
                 .to_vec()
             )
         );
+    }
+
+    #[test]
+    fn a_gyld_decisions_root_reaches_the_supplier_as_decisions_root() {
+        // The owner's folder for written notebooks, passed through the way
+        // `--gyld-root` is: named on grazel's own command line, and handed to
+        // the supplier under the name the supplier knows it by.
+        let c = Config::parse(
+            [
+                "--mode", "both", "--data", "/var/g",
+                "--gyld-supplier-bin", "/bin/glade-gyld",
+                "--gyld-root", "/src/gyld",
+                "--gyld-decisions-root", "/src/glade-wz/decisions",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(
+            c.gyld_decisions_root,
+            Some(PathBuf::from("/src/glade-wz/decisions"))
+        );
+        assert_eq!(
+            c.gyld_supplier_argv(51000),
+            Some(
+                [
+                    "--node", "ws://127.0.0.1:51000",
+                    "--gyld-root", "/src/gyld",
+                    "--bundle-root", "/var/g/files/gyld",
+                    "--decisions-root", "/src/glade-wz/decisions",
+                    "--share", "ws-razel",
+                    "--principal", "grazel",
+                    "--static-base", "/gyld",
+                ]
+                .map(String::from)
+                .to_vec()
+            )
+        );
+
+        // And without the gyld leg it is just a recorded value: no binary, no
+        // argv to carry it in.
+        let bare = Config::parse(
+            ["--mode", "both", "--gyld-decisions-root", "/src/d"].map(String::from),
+        )
+        .unwrap();
+        assert!(!bare.gyld_enabled());
+        assert_eq!(bare.gyld_supplier_argv(51000), None);
     }
 
     #[test]
