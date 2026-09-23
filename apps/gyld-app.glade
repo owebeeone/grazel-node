@@ -11,7 +11,7 @@
 # each ACL seed COMPILES TO a CapabilityGrant record at registration. The fold
 # stays the only runtime authority — a runtime revocation beats a re-registered
 # seed, always.
-glade-app v0
+glade-app v1
 app gyld
 
 # binding <glade_id> <shape> <authority> <zone> <retention> [ttl=<duration>] [shape-profile=<profile>]
