@@ -78,6 +78,14 @@ grazel passes both files to the node. Registration is idempotent by diff, so the
 `workspace ws-razel razel` entry both files declare registers once (the node
 logs the second as `1 unchanged`).
 
+The files' format — the `glade-app v1` header, each line, and what the node
+checks — is described in the glade repository's `docs/AppFileFormat.md`. The
+node prints an app-file warning on its stderr, as `<file>: warning: line N: …`,
+and goes on starting. grazel forwards the node's stderr to its own for as long
+as the node runs, line by line as it arrives, with a `[node] ` prefix, so the
+warning shows in grazel's stderr as `[node] <file>: warning: line N: …`. The
+tail grazel prints if the node exits is the last 20 of those lines.
+
 ## The gyld static path
 
 `GET /gyld/<path>` serves `<data>/files/gyld/<path>` when the gyld leg is on,
