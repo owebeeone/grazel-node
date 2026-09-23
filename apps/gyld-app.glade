@@ -14,7 +14,11 @@
 glade-app v0
 app gyld
 
-# binding <glade_id> <shape> <authority> <zone> <retention>
+# binding <glade_id> <shape> <authority> <zone> <retention> [ttl=<duration>] [shape-profile=<profile>]
+# The key=value tail after the five tokens is optional: `ttl=10m` goes with the
+# retention `ttl`, and a `crdt` line needs `shape-profile=text_crdt`. A valid
+# five-token line is never refused, so no error will show you the tail: it is
+# written down here and in glade/docs/AppFileFormat.md.
 # The surfaces the glade-gyld supplier publishes onto after a successful build
 # (GyldGrythPlugins.md 4.7, step 4.2). Pre-declared here so they exist node-side
 # whether or not a supplier is running.
