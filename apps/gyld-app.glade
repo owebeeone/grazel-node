@@ -3,8 +3,8 @@
 # A SEPARATE app declaration rather than a growing grazel-app.glade (owner ruling
 # O5, GyldGrythPlugins.md section 8). grazel loads it as a SECOND `--app` file
 # when its gyld leg is switched on with `--gyld-supplier-bin`; the glade node has
-# always accepted `--app` more than once, so grazel-app.glade stays exactly as it
-# is, byte-identical in both of its homes.
+# always accepted `--app` more than once, so the gyld leg changed nothing in
+# grazel-app.glade, which is kept byte-identical in both of its homes.
 #
 # Like every app file this one is LOADED, never compiled: each declaration
 # registers as an ordinary home-share record under the registrant's chain, and
