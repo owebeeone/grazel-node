@@ -51,6 +51,13 @@ binding gyld.file      value share commons latest
 binding gyld.output    log   share commons from-cursor
 binding gyld.ask       log   share commons from-cursor
 
+# The desk's appearance (Glial appearance plan, Step 1.4): theme, UI zoom, font
+# scale and wallpaper as one value per user, written by the desk's own pages
+# rather than the supplier. The zone is private and the key is
+# `self:<principal>`, which the client builds itself: glial's zone fill never
+# reaches the wire (glade/docs/AppFileFormat.md, the zone).
+binding gyld.appearance value share private latest
+
 # service <name> <exchange-glade-id>
 # The authority provider grazel attaches, and the DIRECTED surface it answers.
 # Exchanges never fan out: only the claim-holding node's provider replies.
