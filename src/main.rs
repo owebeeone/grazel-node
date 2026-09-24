@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use grazel::{
-    bootstrap_json, ensure_data_layout, open_application_store, read_static, Config,
-    GYLD_STATIC_BASE,
+    bootstrap_json_with_principal, ensure_data_layout, open_application_store, read_static,
+    Config, GYLD_STATIC_BASE,
 };
 
 /// PID of the spawned glade node, for the signal handler to tear down.
@@ -155,7 +155,12 @@ fn main() {
     spawn_gyld_supplier(&cfg, node_port);
 
     // ---- serve HTTP (ui + /bootstrap.json + the gyld bundle root) ----------
-    let boot = bootstrap_json(node_port, cfg.mode.as_str(), &cfg.name);
+    let boot = bootstrap_json_with_principal(
+        node_port,
+        cfg.mode.as_str(),
+        &cfg.name,
+        cfg.principal.as_deref(),
+    );
     let ui = cfg.ui.clone();
     let gyld = cfg.gyld_enabled().then(|| cfg.gyld_dir());
     let http_port = cfg.http_port;

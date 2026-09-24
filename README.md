@@ -32,7 +32,7 @@ child down.
            [--node-port PORT] [--ui DIR] [--app FILE.glade] [--node-bin PATH] \
            [--gwz-supplier-bin PATH] \
            [--gyld-supplier-bin PATH --gyld-root DIR [--gyld-app FILE.glade]] \
-           [--no-suppliers]
+           [--principal NAME] [--no-suppliers]
 
 Defaults: `--name grazel`, `--data grazel-data`, `--http 8080`,
 `--node-port 9099` (0 = OS-assigned), `--ui ui`,
@@ -40,6 +40,12 @@ Defaults: `--name grazel`, `--data grazel-data`, `--http 8080`,
 `--gwz-supplier-bin ../glade-gwz/target/debug/glade-gwz`,
 `--gyld-app apps/gyld-app.glade`. The gyld leg is **default off**:
 `--gyld-supplier-bin` is its switch.
+
+`--principal NAME` is optional, and grazel has no default: given one, it names
+the user every tab of the desk presents, and grazel serves it in
+`/bootstrap.json`. gyld-ui passes `owner` once its Step 1.2 lands. NAME is 1 to
+63 of `A-Z a-z 0-9 . _ -`, so never empty, never whitespace or a control
+character, and never the 64 lower-case hex digits the node reads as a node id.
 
 ## Composed suppliers
 
@@ -96,7 +102,8 @@ consumer checks the digest rather than trusting the pointer.
 
 `GET /bootstrap.json` → `{"node_ws":"ws://127.0.0.1:<node-port>","mode":<mode>,
 "name":<name>}` — the GDL-032 session-placement seam. Grant-handoff fields
-arrive with P2.
+arrive with P2. Given `--principal`, the body also carries
+`"principal":<principal>` after `name`; without it, there is no such field.
 
 ## Modes
 

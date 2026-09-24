@@ -81,6 +81,9 @@ USAGE:
 OPTIONS:
     --mode <local|peer|both>  run mode (required)
     --name <NAME>             node/session name (default: grazel)
+    --principal <NAME>        the principal every tab of the desk presents,
+                              served in /bootstrap.json only when given (no
+                              default); 1 to 63 of A-Z a-z 0-9 . _ -
     --data <DIR>              app-owned storage root: DIR/{sys,files,config,state}
                               (default: grazel-data) — NEVER the real ~/.glade
     --http <PORT>             grazel HTTP (ui + /bootstrap.json) (default: 8080)
@@ -114,6 +117,11 @@ OPTIONS:
 pub struct Config {
     pub mode: Mode,
     pub name: String,
+    /// The principal every tab of the desk presents in its Hello, served in
+    /// `/bootstrap.json` only when given (Glial appearance plan §2, Step 1.1).
+    /// grazel has no default: gyld-ui names `owner` (its Step 1.2).
+    /// `parse_principal` says what it refuses.
+    pub principal: Option<String>,
     pub data: PathBuf,
     pub http_port: u16,
     pub node_port: u16,
@@ -152,6 +160,7 @@ impl Config {
     pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> {
         let mut mode: Option<String> = None;
         let mut name = "grazel".to_string();
+        let mut principal: Option<String> = None;
         let mut data = PathBuf::from("grazel-data");
         let mut http_port: u16 = 8080;
         let mut node_port: u16 = 9099;
@@ -170,6 +179,9 @@ impl Config {
             match a.as_str() {
                 "--mode" => mode = Some(next(&mut it, "--mode")?),
                 "--name" => name = next(&mut it, "--name")?,
+                "--principal" => {
+                    principal = Some(parse_principal(&next(&mut it, "--principal")?)?)
+                }
                 "--data" => data = PathBuf::from(next(&mut it, "--data")?),
                 "--http" => http_port = parse_port(&next(&mut it, "--http")?, "--http")?,
                 "--node-port" => {
@@ -205,6 +217,7 @@ impl Config {
         Ok(Config {
             mode,
             name,
+            principal,
             data,
             http_port,
             node_port,
@@ -349,6 +362,36 @@ fn parse_port(s: &str, flag: &str) -> Result<u16, String> {
     s.parse::<u16>().map_err(|_| format!("{flag}: {s:?} is not a valid port\n\n{USAGE}"))
 }
 
+/// Check a `--principal` value. grazel holds it to the set gyld-ui's own
+/// `--principal` takes, 1 to 63 of `A-Z a-z 0-9 . _ -` (Glial appearance plan
+/// §2), and names the first rule a refused value breaks:
+/// - empty: the node's Hello binds no principal for an empty name;
+/// - 64 lower-case hex digits: the node reads that as a node id, and a Hello
+///   naming one binds no principal (slice 4.3, ruled 2026-09-24);
+/// - whitespace or a control character: unseen in a log, a URL or a terminal,
+///   and `owner ` would be a second user who looks like the first;
+/// - any other character, or more than 63: outside the set, which keeps
+///   `?principal=` and the `self:<principal>` key free of escaping.
+fn parse_principal(s: &str) -> Result<String, String> {
+    let refuse = |why: &str| format!("--principal: {s:?} {why}\n\n{USAGE}");
+    if s.is_empty() {
+        return Err(refuse("is empty: the node binds no principal for an empty name"));
+    }
+    if s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(refuse("is 64 lower-case hex digits, which the node reads as a node id"));
+    }
+    if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(refuse("holds whitespace or a control character"));
+    }
+    if !s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) {
+        return Err(refuse("may hold only A-Z a-z 0-9 . _ and -"));
+    }
+    if s.len() > 63 {
+        return Err(refuse("is longer than 63 characters"));
+    }
+    Ok(s.to_string())
+}
+
 /// Create the app-owned storage layout `<data>/{sys,files,config,state}`.
 ///
 /// The data-seam rule (README): glade never sees grazel's files. `sys` is
@@ -379,11 +422,27 @@ pub fn open_application_store(
 /// The `GET /bootstrap.json` body — the GDL-032 session-placement seam. Grant
 /// handoff fields arrive with P2; today it carries the node WS URL + identity.
 pub fn bootstrap_json(node_ws_port: u16, mode: &str, name: &str) -> String {
+    bootstrap_json_with_principal(node_ws_port, mode, name, None)
+}
+
+/// The same body, with `"principal"` after `name` when grazel was given
+/// `--principal` (Glial appearance plan §2, Step 1.1). With none it is
+/// `bootstrap_json`'s body byte for byte.
+pub fn bootstrap_json_with_principal(
+    node_ws_port: u16,
+    mode: &str,
+    name: &str,
+    principal: Option<&str>,
+) -> String {
+    let principal = principal
+        .map(|p| format!(",\"principal\":\"{}\"", json_escape(p)))
+        .unwrap_or_default();
     format!(
-        "{{\"node_ws\":\"ws://127.0.0.1:{}\",\"mode\":\"{}\",\"name\":\"{}\"}}",
+        "{{\"node_ws\":\"ws://127.0.0.1:{}\",\"mode\":\"{}\",\"name\":\"{}\"{}}}",
         node_ws_port,
         json_escape(mode),
-        json_escape(name)
+        json_escape(name),
+        principal
     )
 }
 
@@ -466,6 +525,7 @@ mod tests {
         let c = Config::parse(["--mode", "both"].map(String::from)).unwrap();
         assert_eq!(c.mode, Mode::Both);
         assert_eq!(c.name, "grazel");
+        assert_eq!(c.principal, None, "grazel names no principal unless it is given one");
         assert_eq!(c.data, PathBuf::from("grazel-data"));
         assert_eq!(c.http_port, 8080);
         assert_eq!(c.node_port, 9099);
@@ -481,12 +541,13 @@ mod tests {
         let args = [
             "--mode", "peer", "--name", "n1", "--data", "/tmp/d", "--http", "18080",
             "--node-port", "0", "--ui", "web", "--app", "a.glade", "--node-bin", "/x/glade-node",
-            "--gwz-supplier-bin", "/x/glade-gwz", "--no-suppliers",
+            "--gwz-supplier-bin", "/x/glade-gwz", "--no-suppliers", "--principal", "it-user",
         ]
         .map(String::from);
         let c = Config::parse(args).unwrap();
         assert_eq!(c.mode, Mode::Peer);
         assert_eq!(c.name, "n1");
+        assert_eq!(c.principal.as_deref(), Some("it-user"));
         assert_eq!(c.data, PathBuf::from("/tmp/d"));
         assert_eq!(c.http_port, 18080);
         assert_eq!(c.node_port, 0);
@@ -726,6 +787,43 @@ mod tests {
     }
 
     #[test]
+    fn principal_accepts_owner_and_the_names_gyld_ui_allows() {
+        // 1 to 63 of A-Z a-z 0-9 . _ -, the set gyld-ui's --principal takes.
+        // 63 hex digits is one short of a node id, so it is an ordinary name.
+        let longest = "p".repeat(63);
+        let hex63 = "0123456789abcdef".repeat(4)[..63].to_string();
+        for name in ["owner", "it-user", "a.b_c-D9", longest.as_str(), hex63.as_str()] {
+            let c = Config::parse(["--mode", "both", "--principal", name].map(String::from)).unwrap();
+            assert_eq!(c.principal.as_deref(), Some(name));
+        }
+    }
+
+    #[test]
+    fn principal_refuses_a_node_id_empty_whitespace_control_and_the_rest() {
+        let node_id = "0123456789abcdef".repeat(4);
+        let upper_hex = node_id.to_uppercase();
+        let too_long = "p".repeat(64);
+        let cases = [
+            (node_id.as_str(), "which the node reads as a node id"),
+            ("", "is empty"),
+            ("a b", "whitespace or a control character"),
+            ("owner ", "whitespace or a control character"),
+            ("a\tb", "whitespace or a control character"),
+            ("own\u{7}er", "whitespace or a control character"),
+            ("\u{1b}[31mowner", "whitespace or a control character"),
+            ("a:b", "may hold only"),
+            ("\u{f3}wner", "may hold only"),
+            (too_long.as_str(), "longer than 63"),
+            (upper_hex.as_str(), "longer than 63"),
+        ];
+        for (name, why) in cases {
+            let err = Config::parse(["--mode", "both", "--principal", name].map(String::from))
+                .unwrap_err();
+            assert!(err.starts_with("--principal: ") && err.contains(why), "{name:?}: {err}");
+        }
+    }
+
+    #[test]
     fn glade_home_is_under_data_sys() {
         let c = Config::parse(["--mode", "both", "--data", "/var/g"].map(String::from)).unwrap();
         assert_eq!(c.glade_home(), PathBuf::from("/var/g/sys"));
@@ -762,6 +860,21 @@ mod tests {
     fn bootstrap_json_escapes_name() {
         let j = bootstrap_json(1, "local", "a\"b\\c");
         assert!(j.contains(r#""name":"a\"b\\c""#), "{j}");
+    }
+
+    #[test]
+    fn bootstrap_json_names_a_principal_only_when_given_one() {
+        assert_eq!(
+            bootstrap_json_with_principal(9099, "both", "grazel", Some("it-user")),
+            r#"{"node_ws":"ws://127.0.0.1:9099","mode":"both","name":"grazel","principal":"it-user"}"#
+        );
+        // With none, the body is the original one, byte for byte.
+        assert_eq!(
+            bootstrap_json_with_principal(9099, "both", "grazel", None),
+            r#"{"node_ws":"ws://127.0.0.1:9099","mode":"both","name":"grazel"}"#
+        );
+        let j = bootstrap_json_with_principal(1, "local", "n", Some("p\"q"));
+        assert!(j.contains(r#""principal":"p\"q""#), "{j}");
     }
 
     #[test]

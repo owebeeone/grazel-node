@@ -121,6 +121,7 @@ fn grazel_both_mode_serves_bootstrap_static_and_node() {
             "--node-port", "0",
             "--node-bin", node_bin().to_str().unwrap(),
             "--app", app.to_str().unwrap(),
+            "--principal", "it-user",
         ])
         .env("HOME", &home) // belt-and-suspenders: never the real ~/.glade
         .stdout(Stdio::inherit())
@@ -134,6 +135,7 @@ fn grazel_both_mode_serves_bootstrap_static_and_node() {
     let boot = String::from_utf8(boot_body).unwrap();
     assert!(boot.contains("\"mode\":\"both\""), "bootstrap mode: {boot}");
     assert!(boot.contains("\"name\":\"grazel-it\""), "bootstrap name: {boot}");
+    assert!(boot.contains("\"principal\":\"it-user\""), "bootstrap principal: {boot}");
     let ws_port = node_ws_port(&boot).expect("bootstrap carries a node ws port");
     assert!(ws_port > 0, "node ws port should be OS-assigned nonzero: {boot}");
 
@@ -536,6 +538,11 @@ async fn grazel_both_mode_composes_gyld_supplier_and_loads_a_second_app_file() {
         }
     };
     assert!(exited, "grazel exits on SIGTERM");
+
+    // Like the desk gyld-ui starts today, this grazel was given no `--principal`,
+    // so the body carries no `principal` key: it is what it was before Step 1.1.
+    // Checked after the shutdown, so that a failure leaves no process behind.
+    assert!(!boot.contains("\"principal\""), "no --principal, no principal field: {boot}");
 
     let _ = grazel.wait();
     std::fs::remove_dir_all(&base).ok();
