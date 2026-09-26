@@ -20,8 +20,10 @@ path = "src/main.rs"
 # optimization), so grazel needs no tokio of its own. axum would drag in
 # hyper + tower + tokio just to serve static files and one JSON route.
 tiny_http = "0.12"
-# libc: SIGINT/SIGTERM handler so a clean shutdown tears down the spawned node
-# child (std has no portable signal handling). Already in the node's dep tree.
+# libc: SIGINT/SIGTERM are blocked in main and taken by one thread with sigwait
+# (no handler), and each child is sent SIGTERM with kill, so a clean shutdown
+# tears the children down (std has no portable signal handling). Already in the
+# node's dep tree.
 libc = "0.2"
 # Generated from datascad/garns-v2's P8 declaration. This is the live
 # application-state store; code under generated/ is never hand-edited.

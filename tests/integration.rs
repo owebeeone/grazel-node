@@ -17,6 +17,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -546,4 +547,152 @@ async fn grazel_both_mode_composes_gyld_supplier_and_loads_a_second_app_file() {
 
     let _ = grazel.wait();
     std::fs::remove_dir_all(&base).ok();
+}
+
+// ---- process globals Step 4.2: a shutdown signal stops every child ---------
+
+/// Every process in process group `pgid`: its pid, parent pid and command.
+fn group_members(pgid: u32) -> Vec<(u32, u32, String)> {
+    let out = Command::new("ps")
+        .args([
+            "-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "comm=",
+        ])
+        .output()
+        .expect("run ps");
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let member = |line: &str| {
+        let mut fields = line.split_whitespace();
+        let pid = fields.next()?.parse().ok()?;
+        let ppid = fields.next()?.parse().ok()?;
+        let group: u32 = fields.next()?.parse().ok()?;
+        let command = fields.collect::<Vec<_>>().join(" ");
+        (group == pgid).then_some((pid, ppid, command))
+    };
+    listing.lines().filter_map(member).collect()
+}
+
+/// SIGKILLs a process group when dropped, so a failed test leaves nothing running.
+struct KillGroupOnDrop(u32);
+
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(-(self.0 as i32), libc::SIGKILL);
+        }
+    }
+}
+
+/// grazel in its own process group, as gyld-ui starts it, with the node and
+/// both suppliers. `signal`, sent to grazel alone, must stop every process in
+/// the group, and grazel must exit 130.
+fn a_shutdown_signal_stops_every_child(signal: libc::c_int, name: &str) {
+    if !build_node_or_skip() || !build_gwz_or_skip() || !build_gyld_or_skip() {
+        return; // loud SKIP already printed
+    }
+    let base = std::env::temp_dir().join(format!(
+        "grazel-{name}-it-{}-{}",
+        std::process::id(),
+        free_port()
+    ));
+    let data = base.join("data");
+    let ui = base.join("ui");
+    let home = base.join("home");
+    let gyld_root = base.join("gyld-checkout");
+    std::fs::create_dir_all(&ui).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(gyld_root.join("scripts")).unwrap();
+    std::fs::create_dir_all(gyld_root.join("examples")).unwrap();
+    std::fs::write(ui.join("index.html"), b"<h1>grazel signal it</h1>").unwrap();
+    let apps = Path::new(env!("CARGO_MANIFEST_DIR")).join("apps");
+    let http_port = free_port();
+
+    let mut grazel = Command::new(env!("CARGO_BIN_EXE_grazel"))
+        .args([
+            "--mode",
+            "both",
+            "--name",
+            &format!("grazel-{name}-it"),
+            "--data",
+            data.to_str().unwrap(),
+            "--ui",
+            ui.to_str().unwrap(),
+            "--http",
+            &http_port.to_string(),
+            "--node-port",
+            "0",
+            "--node-bin",
+            node_bin().to_str().unwrap(),
+            "--app",
+            apps.join("grazel-app.glade").to_str().unwrap(),
+            "--gyld-app",
+            apps.join("gyld-app.glade").to_str().unwrap(),
+            "--gwz-supplier-bin",
+            glade_gwz_bin().to_str().unwrap(),
+            "--gyld-supplier-bin",
+            glade_gyld_bin().to_str().unwrap(),
+            "--gyld-root",
+            gyld_root.to_str().unwrap(),
+        ])
+        .env("HOME", &home)
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .process_group(0)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn grazel");
+    let pgid = grazel.id();
+    let _cleanup = KillGroupOnDrop(pgid);
+    wait_for_200(http_port, "/bootstrap.json", 30).expect("grazel serves /bootstrap.json");
+
+    // The node and both suppliers run as grazel's children.
+    let children = || -> Vec<String> {
+        let members = group_members(pgid).into_iter();
+        let children = members.filter(|(_, ppid, _)| *ppid == pgid);
+        children
+            .map(|(_, _, command)| command.rsplit('/').next().unwrap_or("").to_string())
+            .collect()
+    };
+    let wanted = ["glade-node", "glade-gwz", "glade-gyld"];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !wanted.iter().all(|w| children().iter().any(|c| c == w)) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    let started = children();
+    assert!(
+        wanted.iter().all(|w| started.contains(&w.to_string())),
+        "{name}: grazel's children {started:?}"
+    );
+
+    unsafe {
+        libc::kill(pgid as i32, signal);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match grazel.try_wait().unwrap() {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => break None,
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let code = status.and_then(|s| s.code());
+    assert_eq!(code, Some(130), "{name}: grazel's exit {status:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut left = group_members(pgid);
+    while !left.is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+        left = group_members(pgid);
+    }
+    assert!(left.is_empty(), "{name}: left behind: {left:?}");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn sigterm_stops_the_node_and_both_suppliers_and_grazel_exits_130() {
+    a_shutdown_signal_stops_every_child(libc::SIGTERM, "sigterm");
+}
+
+#[test]
+fn sigint_stops_the_node_and_both_suppliers_and_grazel_exits_130() {
+    a_shutdown_signal_stops_every_child(libc::SIGINT, "sigint");
 }

@@ -23,39 +23,10 @@
     },
     {
       "path": "src/main.rs",
-      "kind": "env",
-      "name": "libc::signal",
-      "count": 2,
-      "disposition": "debt",
-      "reason": "A C signal handler, installed for SIGINT and SIGTERM, tears the children down through the PID statics. A signal task (tokio::signal) that owns the child handles needs neither (ProcessGlobalsPlan Step 4.2)."
-    },
-    {
-      "path": "src/main.rs",
       "kind": "process",
       "name": "Command::new",
       "disposition": "permanent",
       "reason": "child_command, the one place grazel builds a child (the node and both suppliers), spawns it with env_clear() plus the start-up snapshot main takes, GLADE_HOME added for the node. The checker lists every Command::new, so a spawn that clears the environment is recorded as permanent, as gwz-core records its own (ProcessGlobalsPlan Step 3.3)."
-    },
-    {
-      "path": "src/main.rs",
-      "kind": "static",
-      "name": "GWZ_PID",
-      "disposition": "debt",
-      "reason": "The gwz supplier's PID for the signal handler; goes with it (ProcessGlobalsPlan Step 4.2)."
-    },
-    {
-      "path": "src/main.rs",
-      "kind": "static",
-      "name": "GYLD_PID",
-      "disposition": "debt",
-      "reason": "The gyld supplier's PID for the signal handler; goes with it (ProcessGlobalsPlan Step 4.2)."
-    },
-    {
-      "path": "src/main.rs",
-      "kind": "static",
-      "name": "NODE_PID",
-      "disposition": "debt",
-      "reason": "The node's PID for the signal handler; goes with it (ProcessGlobalsPlan Step 4.2)."
     }
   ]
 }

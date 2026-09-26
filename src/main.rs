@@ -14,24 +14,36 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
+use std::mem::MaybeUninit;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::mpsc;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use grazel::{
     bootstrap_json_with_principal, ensure_data_layout, open_application_store, read_static, Config,
     Environment, GYLD_STATIC_BASE,
 };
 
-/// PID of the spawned glade node, for the signal handler to tear down.
-static NODE_PID: AtomicI32 = AtomicI32::new(0);
-/// PID of the composed gwz supplier child (0 = none), torn down on shutdown.
-static GWZ_PID: AtomicI32 = AtomicI32::new(0);
-/// PID of the composed gyld supplier child (0 = none), torn down on shutdown.
-static GYLD_PID: AtomicI32 = AtomicI32::new(0);
+/// How often `main` looks for a child that has exited while it supervises.
+const SUPERVISE_TICK: Duration = Duration::from_millis(100);
+
+/// What `main` hears from its threads.
+enum Event {
+    /// The node's actual listening port, or `None` if it closed stdout first.
+    NodePort(Option<u16>),
+    /// SIGINT or SIGTERM arrived.
+    Signal,
+}
+
+/// A composed supplier child and its log label, owned by `main` until reaped.
+struct Supplier {
+    label: &'static str,
+    child: Child,
+}
 
 fn main() {
     let cfg = match Config::parse(std::env::args().skip(1)) {
@@ -75,7 +87,14 @@ fn main() {
         cfg.application_store_path().display()
     );
 
-    install_signal_handlers();
+    // ---- shutdown signals ----------------------------------------------------
+    // SIGINT and SIGTERM are blocked here, before any thread or child exists, so
+    // every thread grazel starts inherits the block and one thread takes them
+    // with `sigwait`: no handler is installed. Each child has them unblocked
+    // again (`child_command`). `main` owns every child, and on either signal it
+    // sends each one it has not reaped SIGTERM and exits 130.
+    let (events_tx, events) = mpsc::channel::<Event>();
+    wait_for_shutdown_signals(block_shutdown_signals(), events_tx.clone());
 
     // ---- spawn the glade node (booted profile form) ------------------------
     let glade_home = cfg.glade_home();
@@ -86,7 +105,7 @@ fn main() {
         glade_home.display(),
         cfg.node_bin.display()
     );
-    let mut child = match child_command(&cfg.node_bin, &start_env)
+    let mut node = match child_command(&cfg.node_bin, &start_env)
         .args(cfg.node_argv())
         .env("GLADE_HOME", &glade_home) // NEVER the real ~/.glade
         .stdout(Stdio::piped())
@@ -99,11 +118,9 @@ fn main() {
             std::process::exit(2);
         }
     };
-    NODE_PID.store(child.id() as i32, Ordering::SeqCst);
 
-    // Drain node stdout: forward it, and capture the actual listening port.
-    let (port_tx, port_rx) = mpsc::channel::<Option<u16>>();
-    let stdout = child.stdout.take().expect("node stdout piped");
+    // Drain node stdout: forward it, and tell `main` the actual listening port.
+    let stdout = node.stdout.take().expect("node stdout piped");
     thread::spawn(move || {
         let mut sent = false;
         for line in BufReader::new(stdout).lines() {
@@ -111,19 +128,19 @@ fn main() {
             println!("[node] {line}");
             if !sent {
                 if let Some(p) = line.strip_prefix("listening ").and_then(|r| r.trim().parse().ok()) {
-                    let _ = port_tx.send(Some(p));
+                    let _ = events_tx.send(Event::NodePort(Some(p)));
                     sent = true;
                 }
             }
         }
         if !sent {
-            let _ = port_tx.send(None); // node closed stdout before ever listening
+            let _ = events_tx.send(Event::NodePort(None)); // node closed stdout before ever listening
         }
     });
 
     // Drain node stderr: forward it, and keep the last ~20 lines for the tail.
     let tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let stderr = child.stderr.take().expect("node stderr piped");
+    let stderr = node.stderr.take().expect("node stderr piped");
     let tail_w = tail.clone();
     thread::spawn(move || {
         for line in BufReader::new(stderr).lines() {
@@ -137,11 +154,12 @@ fn main() {
         }
     });
 
-    // Wait for the node's actual listening port (or an early exit).
-    let node_port = match port_rx.recv() {
-        Ok(Some(p)) => p,
-        _ => {
-            let _ = child.wait();
+    // Wait for the node's actual listening port (or an early exit, or a signal).
+    let node_port = match events.recv() {
+        Ok(Event::NodePort(Some(p))) => p,
+        Ok(Event::Signal) => stop(&node, &[]),
+        Ok(Event::NodePort(None)) | Err(_) => {
+            let _ = node.wait();
             eprintln!("[grazel] node exited before it started listening.\n{}", stderr_tail(&tail));
             std::process::exit(1);
         }
@@ -154,8 +172,9 @@ fn main() {
     // supervises it non-fatally (a supplier is OPTIONAL; its exit never stops
     // grazel). The chat supplier is TS/in-process in the UI host, not run here;
     // its surfaces are pre-declared in grazel-app.glade instead.
-    spawn_gwz_supplier(&cfg, node_port, &start_env);
-    spawn_gyld_supplier(&cfg, node_port, &start_env);
+    let mut suppliers: Vec<Supplier> = Vec::new();
+    suppliers.extend(spawn_gwz_supplier(&cfg, node_port, &start_env));
+    suppliers.extend(spawn_gyld_supplier(&cfg, node_port, &start_env));
 
     // ---- serve HTTP (ui + /bootstrap.json + the gyld bundle root) ----------
     let boot = bootstrap_json_with_principal(
@@ -174,24 +193,48 @@ fn main() {
         }
     });
 
-    // ---- supervise: node exit is fatal -------------------------------------
-    let status = child.wait().expect("wait on node");
-    eprintln!("[grazel] node exited: {status}\n{}", stderr_tail(&tail));
-    // The node is gone; tear the composed supplier down too (it would otherwise
-    // spin reattaching to a dead node). A supplier exit is NOT fatal, but a node
-    // exit is — so bring the whole tree down.
-    kill_supplier();
-    // Node should never exit while grazel runs -> always nonzero.
-    std::process::exit(status.code().filter(|c| *c != 0).unwrap_or(1));
+    // ---- supervise: node exit is fatal, a supplier exit only logs ----------
+    loop {
+        match events.recv_timeout(SUPERVISE_TICK) {
+            Ok(Event::Signal) => stop(&node, &suppliers),
+            Ok(Event::NodePort(_)) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => thread::sleep(SUPERVISE_TICK),
+        }
+        if let Some(status) = node.try_wait().expect("wait on node") {
+            eprintln!("[grazel] node exited: {status}\n{}", stderr_tail(&tail));
+            // The node is gone; tear the composed suppliers down too (they would
+            // otherwise spin reattaching to a dead node). A supplier exit is NOT
+            // fatal, but a node exit is — so bring the whole tree down.
+            for supplier in &suppliers {
+                terminate(&supplier.child);
+            }
+            // Node should never exit while grazel runs -> always nonzero.
+            std::process::exit(status.code().filter(|c| *c != 0).unwrap_or(1));
+        }
+        suppliers.retain_mut(|supplier| !reaped(supplier));
+    }
 }
 
 /// The command for one of grazel's children, the node or a composed supplier:
 /// `program` with the live environment cleared and `start_env` in its place.
 /// A child so sees what grazel started with, never a variable set since
 /// (ProcessGlobalsPlan Step 3.3). Every child grazel spawns is built here.
+///
+/// std starts a child with its parent's signal mask, and every grazel thread
+/// blocks SIGINT and SIGTERM (`block_shutdown_signals`), so the child unblocks
+/// the two between fork and exec. Blocked, they could never stop it.
 fn child_command(program: &Path, start_env: &Environment) -> Command {
     let mut command = Command::new(program);
     command.env_clear().envs(start_env.vars());
+    let shutdown = shutdown_signals();
+    // SAFETY: the hook runs in the forked child before exec and makes only
+    // `sigprocmask`, which is async-signal-safe, on a set built beforehand.
+    unsafe {
+        command.pre_exec(move || {
+            libc::sigprocmask(libc::SIG_UNBLOCK, &shutdown, std::ptr::null_mut());
+            Ok(())
+        });
+    }
     command
 }
 
@@ -201,10 +244,14 @@ fn child_command(program: &Path, start_env: &Environment) -> Command {
 /// node-binary handling. Supervised non-fatally: its stdout/stderr forward with
 /// a `[gwz]` prefix and its exit only logs (grazel keeps running — the surface
 /// simply has no live provider until it is restarted).
-fn spawn_gwz_supplier(cfg: &Config, node_ws_port: u16, start_env: &Environment) {
+fn spawn_gwz_supplier(
+    cfg: &Config,
+    node_ws_port: u16,
+    start_env: &Environment,
+) -> Option<Supplier> {
     if cfg.no_suppliers {
         println!("[grazel] suppliers disabled (--no-suppliers); node only");
-        return;
+        return None;
     }
     if !cfg.gwz_supplier_bin.exists() {
         println!(
@@ -212,29 +259,28 @@ fn spawn_gwz_supplier(cfg: &Config, node_ws_port: u16, start_env: &Environment) 
              (build ../glade-gwz or pass --gwz-supplier-bin; a supplier is optional)",
             cfg.gwz_supplier_bin.display()
         );
-        return;
+        return None;
     }
-    spawn_supplier(
-        "gwz",
-        &cfg.gwz_supplier_bin,
-        &cfg.gwz_supplier_argv(node_ws_port),
-        start_env,
-        &GWZ_PID,
-    );
+    let argv = cfg.gwz_supplier_argv(node_ws_port);
+    spawn_supplier("gwz", &cfg.gwz_supplier_bin, &argv, start_env)
 }
 
 /// Spawn `glade-gyld` as a child supplier, on the same terms as the gwz one and
 /// with the same OPTIONAL posture. The difference is the switch: the gyld leg is
 /// DEFAULT OFF and `--gyld-supplier-bin` turns it on, which is also what makes
 /// grazel load `gyld-app.glade` as a second app file (owner ruling O5).
-fn spawn_gyld_supplier(cfg: &Config, node_ws_port: u16, start_env: &Environment) {
+fn spawn_gyld_supplier(
+    cfg: &Config,
+    node_ws_port: u16,
+    start_env: &Environment,
+) -> Option<Supplier> {
     if !cfg.gyld_enabled() {
-        return;
+        return None;
     }
     let bin = match cfg.gyld_supplier_bin.as_ref() {
         Some(b) => b,
         None => {
-            return;
+            return None;
         }
     };
     let argv = match cfg.gyld_supplier_argv(node_ws_port) {
@@ -244,7 +290,7 @@ fn spawn_gyld_supplier(cfg: &Config, node_ws_port: u16, start_env: &Environment)
                 "[grazel] SKIP gyld supplier: --gyld-root is required (the Gyld checkout its \
                  hosts run out of); the gyld surfaces are declared but have no provider"
             );
-            return;
+            return None;
         }
     };
     if !bin.exists() {
@@ -253,21 +299,20 @@ fn spawn_gyld_supplier(cfg: &Config, node_ws_port: u16, start_env: &Environment)
              (build ../glade-gyld; a supplier is optional)",
             bin.display()
         );
-        return;
+        return None;
     }
-    spawn_supplier("gyld", bin, &argv, start_env, &GYLD_PID);
+    spawn_supplier("gyld", bin, &argv, start_env)
 }
 
 /// Spawn one composed supplier child, forward its output under `[label]`, and
-/// supervise it non-fatally: a supplier exit only logs, because its surface
-/// simply has no live provider until it is restarted.
+/// hand it to `main`, which supervises it non-fatally: a supplier exit only
+/// logs, because its surface simply has no live provider until it is restarted.
 fn spawn_supplier(
     label: &'static str,
     bin: &Path,
     argv: &[String],
     start_env: &Environment,
-    slot: &'static AtomicI32,
-) {
+) -> Option<Supplier> {
     println!("[grazel] spawning {label} supplier: {} {}", bin.display(), argv.join(" "));
     let mut child = match child_command(bin, start_env)
         .args(argv)
@@ -279,10 +324,9 @@ fn spawn_supplier(
         Err(e) => {
             // Spawn failure is non-fatal too — log and carry on without it.
             eprintln!("[grazel] {label} supplier failed to spawn ({e}); continuing without it");
-            return;
+            return None;
         }
     };
-    slot.store(child.id() as i32, Ordering::SeqCst);
 
     if let Some(out) = child.stdout.take() {
         thread::spawn(move || {
@@ -299,30 +343,43 @@ fn spawn_supplier(
         });
     }
 
-    // Supervise non-fatally: reap the child and log its exit; grazel lives on.
-    thread::spawn(move || {
-        let status = child.wait();
-        slot.store(0, Ordering::SeqCst);
-        match status {
-            Ok(s) => eprintln!(
-                "[grazel] {label} supplier exited: {s} (non-fatal; surface has no provider until respawn)"
-            ),
-            Err(e) => eprintln!("[grazel] {label} supplier wait failed: {e}"),
-        }
-    });
+    Some(Supplier { label, child })
 }
 
-/// Tear every composed supplier child down (SIGTERM). Async-signal unsafe (it
-/// loads + branches), so it is called only from the normal exit path; the signal
-/// handler uses the raw async-safe `kill` directly.
-fn kill_supplier() {
-    for slot in [&GWZ_PID, &GYLD_PID] {
-        let pid = slot.swap(0, Ordering::SeqCst);
-        if pid > 0 {
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
+/// Has `supplier` exited? It is reaped and its exit logged here, and grazel
+/// lives on: a supplier exit is non-fatal.
+fn reaped(supplier: &mut Supplier) -> bool {
+    let label = supplier.label;
+    match supplier.child.try_wait() {
+        Ok(None) => false,
+        Ok(Some(s)) => {
+            eprintln!(
+                "[grazel] {label} supplier exited: {s} (non-fatal; surface has no provider until respawn)"
+            );
+            true
         }
+        Err(e) => {
+            eprintln!("[grazel] {label} supplier wait failed: {e}");
+            true
+        }
+    }
+}
+
+/// SIGINT or SIGTERM: send SIGTERM to every child grazel has not reaped, and
+/// exit 130. An unreaped child is still grazel's to wait for, running or exited,
+/// so its PID cannot have been reused.
+fn stop(node: &Child, suppliers: &[Supplier]) -> ! {
+    terminate(node);
+    for supplier in suppliers {
+        terminate(&supplier.child);
+    }
+    std::process::exit(130);
+}
+
+/// Send `child` SIGTERM (std's `Child::kill` sends SIGKILL).
+fn terminate(child: &Child) {
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
     }
 }
 
@@ -389,34 +446,43 @@ fn header(k: &str, v: &str) -> tiny_http::Header {
     tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()).expect("valid header")
 }
 
-/// SIGINT/SIGTERM -> kill the node child, then exit. `kill` and `_exit` are
-/// async-signal-safe, which is all the handler does.
-fn install_signal_handlers() {
-    let handler = on_signal as *const () as libc::sighandler_t;
+/// SIGINT and SIGTERM, the two signals that stop grazel.
+fn shutdown_signals() -> libc::sigset_t {
+    let mut set = MaybeUninit::<libc::sigset_t>::uninit();
     unsafe {
-        libc::signal(libc::SIGINT, handler);
-        libc::signal(libc::SIGTERM, handler);
+        libc::sigemptyset(set.as_mut_ptr());
+        libc::sigaddset(set.as_mut_ptr(), libc::SIGINT);
+        libc::sigaddset(set.as_mut_ptr(), libc::SIGTERM);
+        set.assume_init()
     }
 }
 
-extern "C" fn on_signal(_sig: libc::c_int) {
-    // Tear down BOTH children (node + composed supplier). `kill` is
-    // async-signal-safe; the two atomic loads are lock-free integer reads.
-    let node = NODE_PID.load(Ordering::SeqCst);
-    let gwz = GWZ_PID.load(Ordering::SeqCst);
-    let gyld = GYLD_PID.load(Ordering::SeqCst);
+/// Block SIGINT and SIGTERM in the calling thread, and return the two. `main`
+/// calls it before any thread or child exists, so every thread grazel starts
+/// inherits the block: neither signal runs a handler or ends grazel by default,
+/// and only the thread `wait_for_shutdown_signals` starts takes them. This is
+/// process-wide state, set once at the entry point, like the arguments. A
+/// child would inherit it too, and `child_command` undoes it there.
+fn block_shutdown_signals() -> libc::sigset_t {
+    let set = shutdown_signals();
     unsafe {
-        if node > 0 {
-            libc::kill(node, libc::SIGTERM);
-        }
-        if gwz > 0 {
-            libc::kill(gwz, libc::SIGTERM);
-        }
-        if gyld > 0 {
-            libc::kill(gyld, libc::SIGTERM);
-        }
-        libc::_exit(130);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
     }
+    set
+}
+
+/// Start the one thread that takes SIGINT and SIGTERM, with `sigwait`, and
+/// tells `main`, which stops every child and exits 130.
+fn wait_for_shutdown_signals(set: libc::sigset_t, events: mpsc::Sender<Event>) {
+    thread::spawn(move || loop {
+        let mut signal: libc::c_int = 0;
+        if unsafe { libc::sigwait(&set, &mut signal) } != 0 {
+            continue;
+        }
+        if events.send(Event::Signal).is_err() {
+            return;
+        }
+    });
 }
 
 #[cfg(test)]
@@ -474,5 +540,42 @@ mod tests {
         let names: BTreeSet<String> = names.filter(kept).collect();
         let seen: BTreeSet<String> = seen.into_iter().filter(kept).collect();
         assert_eq!(seen, names, "the start-up names, and nothing set since");
+    }
+
+    /// The signals the calling thread blocks, among 1 to 31.
+    fn blocked_here() -> Vec<libc::c_int> {
+        let mut set = MaybeUninit::<libc::sigset_t>::uninit();
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), set.as_mut_ptr());
+            let set = set.assume_init();
+            let blocked = |&signal: &libc::c_int| libc::sigismember(&set, signal) == 1;
+            (1..32).filter(blocked).collect()
+        }
+    }
+
+    /// Run by python3, the child: print the signals it started with blocked.
+    const PRINT_BLOCKED: &str =
+        "import signal as s; print(sorted(map(int, s.pthread_sigmask(s.SIG_BLOCK, []))))";
+
+    #[test]
+    fn a_child_starts_with_no_signal_blocked() {
+        // This test's thread blocks SIGINT and SIGTERM, as every grazel thread
+        // does, and std hands a child its parent's mask: `child_command` must
+        // unblock the two in the child.
+        let set = block_shutdown_signals();
+        let blocked = blocked_here();
+        let start_env = Environment::from_vars(std::env::vars_os());
+        let out = child_command(Path::new("python3"), &start_env)
+            .args(["-c", PRINT_BLOCKED])
+            .output();
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        }
+        let both = [libc::SIGINT, libc::SIGTERM];
+        assert!(both.iter().all(|s| blocked.contains(s)), "{blocked:?}");
+        let out = out.expect("run python3 as the child");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "the child failed: {stderr}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[]");
     }
 }
