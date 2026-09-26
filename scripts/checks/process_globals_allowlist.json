@@ -17,6 +17,13 @@
     {
       "path": "src/main.rs",
       "kind": "env",
+      "name": "env::vars_os",
+      "disposition": "permanent",
+      "reason": "The program reads its environment once, at its entry point, and spawns every child with env_clear() plus that snapshot (ProcessGlobalsPlan Step 3.3)."
+    },
+    {
+      "path": "src/main.rs",
+      "kind": "env",
       "name": "libc::signal",
       "count": 2,
       "disposition": "debt",
@@ -26,9 +33,8 @@
       "path": "src/main.rs",
       "kind": "process",
       "name": "Command::new",
-      "count": 2,
-      "disposition": "debt",
-      "reason": "Spawns the node and the composed suppliers with the live process environment (it sets GLADE_HOME and inherits the rest); spawn them with env_clear() plus an explicit environment (ProcessGlobalsPlan Step 3.3)."
+      "disposition": "permanent",
+      "reason": "child_command, the one place grazel builds a child (the node and both suppliers), spawns it with env_clear() plus the start-up snapshot main takes, GLADE_HOME added for the node. The checker lists every Command::new, so a spawn that clears the environment is recorded as permanent, as gwz-core records its own (ProcessGlobalsPlan Step 3.3)."
     },
     {
       "path": "src/main.rs",

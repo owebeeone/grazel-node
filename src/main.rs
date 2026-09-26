@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use grazel::{
-    bootstrap_json_with_principal, ensure_data_layout, open_application_store, read_static,
-    Config, GYLD_STATIC_BASE,
+    bootstrap_json_with_principal, ensure_data_layout, open_application_store, read_static, Config,
+    Environment, GYLD_STATIC_BASE,
 };
 
 /// PID of the spawned glade node, for the signal handler to tear down.
@@ -47,6 +47,9 @@ fn main() {
             std::process::exit(if help { 0 } else { 2 });
         }
     };
+    // grazel's start-up environment, read once, here: each child gets it in
+    // place of the live environment (`child_command`).
+    let start_env = Environment::from_vars(std::env::vars_os());
 
     if let Err(e) = ensure_data_layout(&cfg.data) {
         eprintln!("[grazel] cannot create data layout under {}: {e}", cfg.data.display());
@@ -83,7 +86,7 @@ fn main() {
         glade_home.display(),
         cfg.node_bin.display()
     );
-    let mut child = match Command::new(&cfg.node_bin)
+    let mut child = match child_command(&cfg.node_bin, &start_env)
         .args(cfg.node_argv())
         .env("GLADE_HOME", &glade_home) // NEVER the real ~/.glade
         .stdout(Stdio::piped())
@@ -151,8 +154,8 @@ fn main() {
     // supervises it non-fatally (a supplier is OPTIONAL; its exit never stops
     // grazel). The chat supplier is TS/in-process in the UI host, not run here;
     // its surfaces are pre-declared in grazel-app.glade instead.
-    spawn_gwz_supplier(&cfg, node_port);
-    spawn_gyld_supplier(&cfg, node_port);
+    spawn_gwz_supplier(&cfg, node_port, &start_env);
+    spawn_gyld_supplier(&cfg, node_port, &start_env);
 
     // ---- serve HTTP (ui + /bootstrap.json + the gyld bundle root) ----------
     let boot = bootstrap_json_with_principal(
@@ -182,13 +185,23 @@ fn main() {
     std::process::exit(status.code().filter(|c| *c != 0).unwrap_or(1));
 }
 
+/// The command for one of grazel's children, the node or a composed supplier:
+/// `program` with the live environment cleared and `start_env` in its place.
+/// A child so sees what grazel started with, never a variable set since
+/// (ProcessGlobalsPlan Step 3.3). Every child grazel spawns is built here.
+fn child_command(program: &Path, start_env: &Environment) -> Command {
+    let mut command = Command::new(program);
+    command.env_clear().envs(start_env.vars());
+    command
+}
+
 /// Spawn `glade-gwz` as a child supplier attached to the node's WS carrier.
 /// OPTIONAL: `--no-suppliers` disables it, and an ABSENT binary is a loud SKIP
 /// (never fatal — a supplier's absence must not stop grazel), mirroring the
 /// node-binary handling. Supervised non-fatally: its stdout/stderr forward with
 /// a `[gwz]` prefix and its exit only logs (grazel keeps running — the surface
 /// simply has no live provider until it is restarted).
-fn spawn_gwz_supplier(cfg: &Config, node_ws_port: u16) {
+fn spawn_gwz_supplier(cfg: &Config, node_ws_port: u16, start_env: &Environment) {
     if cfg.no_suppliers {
         println!("[grazel] suppliers disabled (--no-suppliers); node only");
         return;
@@ -201,14 +214,20 @@ fn spawn_gwz_supplier(cfg: &Config, node_ws_port: u16) {
         );
         return;
     }
-    spawn_supplier("gwz", &cfg.gwz_supplier_bin, &cfg.gwz_supplier_argv(node_ws_port), &GWZ_PID);
+    spawn_supplier(
+        "gwz",
+        &cfg.gwz_supplier_bin,
+        &cfg.gwz_supplier_argv(node_ws_port),
+        start_env,
+        &GWZ_PID,
+    );
 }
 
 /// Spawn `glade-gyld` as a child supplier, on the same terms as the gwz one and
 /// with the same OPTIONAL posture. The difference is the switch: the gyld leg is
 /// DEFAULT OFF and `--gyld-supplier-bin` turns it on, which is also what makes
 /// grazel load `gyld-app.glade` as a second app file (owner ruling O5).
-fn spawn_gyld_supplier(cfg: &Config, node_ws_port: u16) {
+fn spawn_gyld_supplier(cfg: &Config, node_ws_port: u16, start_env: &Environment) {
     if !cfg.gyld_enabled() {
         return;
     }
@@ -236,15 +255,21 @@ fn spawn_gyld_supplier(cfg: &Config, node_ws_port: u16) {
         );
         return;
     }
-    spawn_supplier("gyld", bin, &argv, &GYLD_PID);
+    spawn_supplier("gyld", bin, &argv, start_env, &GYLD_PID);
 }
 
 /// Spawn one composed supplier child, forward its output under `[label]`, and
 /// supervise it non-fatally: a supplier exit only logs, because its surface
 /// simply has no live provider until it is restarted.
-fn spawn_supplier(label: &'static str, bin: &Path, argv: &[String], slot: &'static AtomicI32) {
+fn spawn_supplier(
+    label: &'static str,
+    bin: &Path,
+    argv: &[String],
+    start_env: &Environment,
+    slot: &'static AtomicI32,
+) {
     println!("[grazel] spawning {label} supplier: {} {}", bin.display(), argv.join(" "));
-    let mut child = match Command::new(bin)
+    let mut child = match child_command(bin, start_env)
         .args(argv)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -391,5 +416,63 @@ extern "C" fn on_signal(_sig: libc::c_int) {
             libc::kill(gyld, libc::SIGTERM);
         }
         libc::_exit(130);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::ffi::OsString;
+
+    /// What a child built by `child_command` sees: `/usr/bin/awk` names each
+    /// variable it was given, one to a line, and prints a value only for the
+    /// tests' own made-up `GRAZEL_TEST_` variables, so no real value is shown.
+    fn seen_by_child(start_env: &Environment) -> BTreeSet<String> {
+        let names = r#"BEGIN {
+            for (name in ENVIRON) {
+                if (name ~ /^GRAZEL_TEST_/) { print name "=" ENVIRON[name] } else { print name }
+            }
+        }"#;
+        let out = child_command(Path::new("/usr/bin/awk"), start_env)
+            .arg(names)
+            .output()
+            .expect("run /usr/bin/awk as the child");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "the child failed: {stderr}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout.lines().map(String::from).collect()
+    }
+
+    #[test]
+    fn a_child_sees_only_the_snapshot() {
+        let start_env = Environment::from_vars([
+            ("GRAZEL_TEST_KEY", "made-up key"),
+            ("GRAZEL_TEST_PATH", "/made/up/bin"),
+        ]);
+        let want = [
+            "GRAZEL_TEST_KEY=made-up key",
+            "GRAZEL_TEST_PATH=/made/up/bin",
+        ];
+        let want: BTreeSet<String> = want.map(String::from).into();
+        assert_eq!(seen_by_child(&start_env), want);
+    }
+
+    #[test]
+    fn a_variable_set_after_start_is_not_seen() {
+        let at_start: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        let start_env = Environment::from_vars(at_start.clone());
+        std::env::set_var("GRAZEL_TEST_SET_AFTER_START", "made-up late value");
+        let seen = seen_by_child(&start_env);
+        std::env::remove_var("GRAZEL_TEST_SET_AFTER_START");
+        // macOS hands a protected system binary such as /usr/bin/awk no `DYLD_`
+        // variable, so those names are left out on both sides.
+        let kept = |name: &String| !name.starts_with("DYLD_");
+        let names = at_start
+            .iter()
+            .map(|(name, _)| name.to_string_lossy().into_owned());
+        let names: BTreeSet<String> = names.filter(kept).collect();
+        let seen: BTreeSet<String> = seen.into_iter().filter(kept).collect();
+        assert_eq!(seen, names, "the start-up names, and nothing set since");
     }
 }

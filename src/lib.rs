@@ -3,13 +3,16 @@
 //! grazel is a glade APPLICATION (GDL-037): it composes glade suppliers, owns
 //! app storage, and serves gryth-ui. This crate holds the dependency-light,
 //! unit-testable core — CLI parsing, the mode→node-profile mapping, the data
-//! layout, the generated application store, the node argv, and the
-//! `/bootstrap.json` body — so that `main.rs`
+//! layout, the generated application store, the node argv, the children's
+//! environment, and the `/bootstrap.json` body — so that `main.rs`
 //! stays a thin orchestrator (spawn node · serve http · supervise).
 //!
 //! Nothing here touches the network or a store; nothing here reads the real
 //! `~/.glade` (the node always runs under `GLADE_HOME=<data>/sys`, never $HOME).
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub use garns_p8_store::{BindingError as ApplicationStoreError, Store as ApplicationStore};
@@ -390,6 +393,48 @@ fn parse_principal(s: &str) -> Result<String, String> {
         return Err(refuse("is longer than 63 characters"));
     }
     Ok(s.to_string())
+}
+
+/// grazel's start-up environment: every variable the process started with,
+/// read once by `main` and given to each child in place of the live
+/// environment (ProcessGlobalsPlan Step 3.3). A child so gets what it would
+/// have inherited at start, the gyld supplier its agent keys and glade-gwz the
+/// `PATH`, `HOME` and `SSH_AUTH_SOCK` that `gwz` needs, and never a variable
+/// set since. It holds secrets such as API keys, so it never prints a value:
+/// `Debug` shows the names alone.
+pub struct Environment {
+    vars: BTreeMap<OsString, OsString>,
+}
+
+impl Environment {
+    /// The snapshot of `vars`; a name given twice keeps its last value.
+    pub fn from_vars<I, K, V>(vars: I) -> Environment
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
+        let mut snapshot = BTreeMap::new();
+        for (name, value) in vars {
+            snapshot.insert(name.into(), value.into());
+        }
+        Environment { vars: snapshot }
+    }
+
+    /// Each variable's name and value, for a child's `Command::envs`.
+    pub fn vars(&self) -> impl Iterator<Item = (&OsString, &OsString)> {
+        self.vars.iter()
+    }
+}
+
+// By hand, never derived: the names alone, because a value may be a secret.
+impl fmt::Debug for Environment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<&OsString> = self.vars.keys().collect();
+        f.debug_struct("Environment")
+            .field("names", &names)
+            .finish()
+    }
 }
 
 /// Create the app-owned storage layout `<data>/{sys,files,config,state}`.
@@ -907,5 +952,20 @@ mod tests {
         assert_eq!(content_type(Path::new("x.json")), "application/json");
         assert_eq!(content_type(Path::new("x.wasm")), "application/wasm");
         assert_eq!(content_type(Path::new("x.bin")), "application/octet-stream");
+    }
+
+    #[test]
+    fn an_environment_names_its_variables_and_never_prints_a_value() {
+        let env = Environment::from_vars([
+            ("GRAZEL_TEST_KEY", "made-up-secret"),
+            ("GRAZEL_TEST_URL", "made-up-endpoint"),
+        ]);
+        for shown in [format!("{env:?}"), format!("{env:#?}")] {
+            assert!(shown.contains("GRAZEL_TEST_KEY"), "{shown}");
+            assert!(shown.contains("GRAZEL_TEST_URL"), "{shown}");
+            for value in ["made-up-secret", "made-up-endpoint"] {
+                assert!(!shown.contains(value), "Debug shows {value}: {shown}");
+            }
+        }
     }
 }
