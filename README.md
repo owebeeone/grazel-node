@@ -30,6 +30,7 @@ child down.
 
     grazel --mode local|peer|both [--name N] [--data DIR] [--http PORT] \
            [--node-port PORT] [--ui DIR] [--app FILE.glade] [--node-bin PATH] \
+           [--node-config ABSOLUTE_PATH] [--node-app FILE.glade]... \
            [--gwz-supplier-bin PATH] \
            [--gyld-supplier-bin PATH --gyld-root DIR [--gyld-app FILE.glade]] \
            [--principal NAME] [--no-suppliers]
@@ -83,6 +84,13 @@ and neither of its two byte-identical homes moves. When the gyld leg is on,
 grazel passes both files to the node. Registration is idempotent by diff, so the
 `workspace ws-razel razel` entry both files declare registers once (the node
 logs the second as `1 unchanged`).
+
+`--node-app FILE.glade` MAY be repeated to load additional declarations after
+the shipped grazel and optional Gyld apps. `--node-config ABSOLUTE_PATH` MUST
+name an absolute path; Grazel forwards it as the node's `--config`. Glade owns
+network-file and app-file validation. With neither flag, the node argv keeps
+its existing behavior. These options allow the Gyld launcher to supply private
+peer admission and grants without changing the shipped declarations.
 
 The files' format — the `glade-app v1` header, each line, and what the node
 checks — is described in the glade repository's `docs/AppFileFormat.md`. The

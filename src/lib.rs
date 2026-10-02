@@ -95,6 +95,8 @@ OPTIONS:
     --ui <DIR>                static dir served over HTTP (default: ui)
     --app <FILE.glade>        grazel's app declaration
                               (default: apps/grazel-app.glade)
+    --node-config <PATH>      absolute private network config passed to glade-node
+    --node-app <FILE.glade>   additional node app declaration; repeatable
     --node-bin <PATH>         glade-node binary
                               (default: ../glade/node/target/debug/glade-node)
     --gwz-supplier-bin <PATH> glade-gwz supplier binary; spawned as a child
@@ -131,6 +133,10 @@ pub struct Config {
     pub ui: PathBuf,
     pub app: PathBuf,
     pub node_bin: PathBuf,
+    /// Explicit private network file; Glade validates permissions and contents.
+    pub node_config: Option<PathBuf>,
+    /// Additional declarations, loaded after the shipped app files.
+    pub node_apps: Vec<PathBuf>,
     /// The `glade-gwz` supplier binary grazel spawns as a CHILD supplier
     /// alongside the node (the wire-attachment composition, P00-a). Skipped with
     /// a loud log line if absent (a supplier is OPTIONAL — its absence never
@@ -176,6 +182,8 @@ impl Config {
         let mut gyld_decisions_root: Option<PathBuf> = None;
         let mut gyld_app = PathBuf::from("apps/gyld-app.glade");
         let mut no_suppliers = false;
+        let mut node_config = None;
+        let mut node_apps = Vec::new();
 
         let mut it = args.into_iter();
         while let Some(a) = it.next() {
@@ -193,6 +201,16 @@ impl Config {
                 "--ui" => ui = PathBuf::from(next(&mut it, "--ui")?),
                 "--app" => app = PathBuf::from(next(&mut it, "--app")?),
                 "--node-bin" => node_bin = PathBuf::from(next(&mut it, "--node-bin")?),
+                "--node-config" => {
+                    let path = PathBuf::from(next(&mut it, "--node-config")?);
+                    if !path.is_absolute() {
+                        return Err("--node-config requires an absolute path".to_string());
+                    }
+                    node_config = Some(path);
+                }
+                "--node-app" => {
+                    node_apps.push(PathBuf::from(next(&mut it, "--node-app")?));
+                }
                 "--gwz-supplier-bin" => {
                     gwz_supplier_bin = PathBuf::from(next(&mut it, "--gwz-supplier-bin")?)
                 }
@@ -227,6 +245,8 @@ impl Config {
             ui,
             app,
             node_bin,
+            node_config,
+            node_apps,
             gwz_supplier_bin,
             gyld_supplier_bin,
             gyld_root,
@@ -265,6 +285,14 @@ impl Config {
         if self.gyld_enabled() {
             argv.push("--app".to_string());
             argv.push(self.gyld_app.display().to_string());
+        }
+        for app in &self.node_apps {
+            argv.push("--app".to_string());
+            argv.push(app.display().to_string());
+        }
+        if let Some(config) = &self.node_config {
+            argv.push("--config".to_string());
+            argv.push(config.display().to_string());
         }
         argv.push(self.node_port.to_string());
         argv
@@ -563,6 +591,61 @@ mod tests {
         assert_eq!(Mode::Local.as_str(), "local");
         assert_eq!(Mode::Peer.as_str(), "peer");
         assert_eq!(Mode::Both.as_str(), "both");
+    }
+
+    #[test]
+    fn paired_node_options_forward_config_and_extra_apps_in_order() {
+        let c = Config::parse(
+            [
+                "--mode",
+                "both",
+                "--node-config",
+                "/data/network.conf",
+                "--node-app",
+                "/data/peer-grants.glade",
+                "--node-app",
+                "/data/other.glade",
+                "--gyld-supplier-bin",
+                "/bin/glade-gyld",
+                "--gyld-root",
+                "/gyld",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+        let argv = c.node_argv();
+        assert!(argv
+            .windows(2)
+            .any(|a| a == ["--config", "/data/network.conf"]));
+        let apps: Vec<_> = argv
+            .windows(2)
+            .filter(|a| a[0] == "--app")
+            .map(|a| a[1].as_str())
+            .collect();
+        assert_eq!(
+            apps,
+            [
+                "apps/grazel-app.glade",
+                "apps/gyld-app.glade",
+                "/data/peer-grants.glade",
+                "/data/other.glade"
+            ]
+        );
+        assert_eq!(argv.last().unwrap(), "9099");
+    }
+
+    #[test]
+    fn paired_node_options_refuse_missing_values_and_relative_network_path() {
+        for tail in [
+            vec!["--node-config"],
+            vec!["--node-app"],
+            vec!["--node-config", "relative.conf"],
+        ] {
+            let args = ["--mode", "both"].into_iter().chain(tail).map(String::from);
+            assert!(Config::parse(args).is_err());
+        }
+        let c = Config::parse(["--mode", "both"].map(String::from)).unwrap();
+        assert!(!c.node_argv().iter().any(|a| a == "--config"));
     }
 
     #[test]
