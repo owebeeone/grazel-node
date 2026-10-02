@@ -58,6 +58,11 @@ binding gyld.ask       log   share commons from-cursor
 # reaches the wire (glade/docs/AppFileFormat.md, the zone).
 binding gyld.appearance value share private latest
 
+# One mirrored session desk per user/session (SS-03): windows, current desktop,
+# tab destinations and serializable Gyld inputs. Whole-document LWW; appearance
+# stays on its own surface above. Pages build `self:<principal>/<session>` keys.
+binding gyld.desk value share private latest
+
 # service <name> <exchange-glade-id>
 # The authority provider grazel attaches, and the DIRECTED surface it answers.
 # Exchanges never fan out: only the claim-holding node's provider replies.
